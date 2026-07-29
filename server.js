@@ -5,7 +5,7 @@ import express from "express";
 dotenv.config();
 
 const app = express();
-const connectorVersion = "2026-07-29-stock-update-timeout-v2";
+const connectorVersion = "2026-07-30-stock-update-job-v3";
 const port = Number(process.env.PORT || 3000);
 const cin7Username = process.env.CIN7_API_USERNAME || "";
 const cin7ApiKey = process.env.CIN7_API_KEY || "";
@@ -18,6 +18,7 @@ const stockUpdatePin = process.env.CIN7_STOCK_UPDATE_PIN || "";
 const stockUpdateAutoApprove = String(process.env.CIN7_STOCK_UPDATE_AUTO_APPROVE || "true").toLowerCase() !== "false";
 const cin7WriteTimeoutMs = Number(process.env.CIN7_WRITE_TIMEOUT_MS || 55000);
 let productSearchCache = { expiresAt: 0, rows: [] };
+const updateJobs = new Map();
 
 app.use(cors({ origin: allowedOrigin === "*" ? true : allowedOrigin }));
 app.use(express.json({ limit: "10mb" }));
@@ -173,10 +174,10 @@ app.post("/api/stocktake-adjustment", async (req, res) => {
       return res.status(400).json({ error: "No valid stock differences to update" });
     }
 
-    const reference = stocktakeReference();
+    const jobId = stocktakeReference();
     const adjustment = {
       isApproved: stockUpdateAutoApprove,
-      reference,
+      reference: jobId,
       branchId,
       completedDate: new Date().toISOString(),
       adjustmentReason: `Stocktake update${branchName ? ` - ${branchName}` : ""}`,
@@ -184,20 +185,32 @@ app.post("/api/stocktake-adjustment", async (req, res) => {
       lineItems
     };
 
-    const result = await cin7Send("POST", "/Adjustments", [adjustment]);
-    res.json({
-      ok: true,
-      reference,
+    const job = {
+      id: jobId,
+      status: "queued",
+      reference: jobId,
       branchId,
       branchName,
       approved: stockUpdateAutoApprove,
       lineCount: lineItems.length,
       adjustmentTotal: lineItems.reduce((total, line) => total + line.qty, 0),
-      result
-    });
+      createdAt: new Date().toISOString(),
+      completedAt: "",
+      result: null,
+      error: ""
+    };
+    updateJobs.set(jobId, job);
+    runStockUpdateJob(jobId, adjustment);
+    res.json({ ok: true, queued: true, jobId, ...job });
   } catch (error) {
     sendError(res, error);
   }
+});
+
+app.get("/api/stocktake-adjustment-status/:jobId", (req, res) => {
+  const job = updateJobs.get(String(req.params.jobId || ""));
+  if (!job) return res.status(404).json({ error: "Stock update job not found" });
+  res.json({ ok: true, ...job });
 });
 
 async function findStockRows(code) {
@@ -464,11 +477,38 @@ async function cin7Send(method, path, body) {
   return json;
 }
 
+async function runStockUpdateJob(jobId, adjustment) {
+  const job = updateJobs.get(jobId);
+  if (!job) return;
+  job.status = "running";
+  try {
+    const result = await cin7Send("POST", "/Adjustments", [adjustment]);
+    job.status = adjustmentSucceeded(result) ? "complete" : "failed";
+    job.result = result;
+    job.error = job.status === "failed" ? batchErrors(result).join("; ") || "Cin7 rejected the stock adjustment" : "";
+  } catch (error) {
+    job.status = "failed";
+    job.error = error.message || "Cin7 stock update failed";
+  } finally {
+    job.completedAt = new Date().toISOString();
+    updateJobs.set(jobId, job);
+    setTimeout(() => updateJobs.delete(jobId), 60 * 60 * 1000);
+  }
+}
+
+function adjustmentSucceeded(result) {
+  const rows = asArray(result);
+  return rows.length > 0 && rows.every((row) => row.success === true || row.Success === true);
+}
+
+function batchErrors(result) {
+  return asArray(result).flatMap((row) => asArray(row.errors ?? row.Errors)).filter(Boolean);
+}
+
 function stocktakeItemToAdjustmentLine(item, index) {
   const counted = Number(item.countedQty ?? item.qty);
   const current = Number(item.currentQty ?? item.expectedCount);
   const productOptionId = Number(item.productOptionId);
-  const productId = Number(item.productId);
   const qty = counted - current;
 
   if (!Number.isFinite(counted) || !Number.isFinite(current) || !Number.isFinite(productOptionId) || productOptionId <= 0) {
@@ -477,11 +517,10 @@ function stocktakeItemToAdjustmentLine(item, index) {
 
   return {
     productOptionId,
-    ...(Number.isFinite(productId) && productId > 0 ? { productId } : {}),
     code: String(item.sku || item.code || ""),
     name: String(item.name || ""),
     sort: index + 1,
-    qty,
+    qty: counted,
     qtyAdjusted: qty
   };
 }
