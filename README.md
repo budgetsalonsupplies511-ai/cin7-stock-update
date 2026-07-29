@@ -1,0 +1,40 @@
+# Cin7 Omni Scanner Connector
+
+This backend connects the scanner web app to Cin7 Omni. Keep it on Render so your Cin7 API username and key are not placed in the Netlify app.
+
+## Render settings
+
+Build command:
+
+```text
+npm install
+```
+
+Start command:
+
+```text
+npm start
+```
+
+Environment variables:
+
+```text
+CIN7_API_USERNAME=your Cin7 API username
+CIN7_API_KEY=your Cin7 API key
+CIN7_API_BASE_URL=https://api.cin7.com/api/v1
+CIN7_STOCK_UPDATE_PIN=choose a private PIN
+CIN7_STOCK_UPDATE_AUTO_APPROVE=true
+ALLOWED_ORIGIN=*
+```
+
+`CIN7_STOCK_UPDATE_PIN` is required before the stocktake app can update Cin7 stock.
+
+`CIN7_STOCK_UPDATE_AUTO_APPROVE=true` creates an approved adjustment. Set it to `false` if you want Cin7 to create draft adjustments for review instead.
+
+After deploy, open:
+
+```text
+https://your-render-url.onrender.com/api/diagnostics
+```
+
+It should show `ok: true` and `hasUsername: true`, `hasApiKey: true`.
