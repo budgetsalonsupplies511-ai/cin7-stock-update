@@ -5,7 +5,7 @@ import express from "express";
 dotenv.config();
 
 const app = express();
-const connectorVersion = "2026-07-29-stock-update-v1";
+const connectorVersion = "2026-07-29-stock-update-timeout-v2";
 const port = Number(process.env.PORT || 3000);
 const cin7Username = process.env.CIN7_API_USERNAME || "";
 const cin7ApiKey = process.env.CIN7_API_KEY || "";
@@ -16,6 +16,7 @@ const searchPageLimit = Number(process.env.CIN7_SEARCH_PAGE_LIMIT || 5);
 const searchRowsPerPage = Number(process.env.CIN7_SEARCH_ROWS_PER_PAGE || 100);
 const stockUpdatePin = process.env.CIN7_STOCK_UPDATE_PIN || "";
 const stockUpdateAutoApprove = String(process.env.CIN7_STOCK_UPDATE_AUTO_APPROVE || "true").toLowerCase() !== "false";
+const cin7WriteTimeoutMs = Number(process.env.CIN7_WRITE_TIMEOUT_MS || 55000);
 let productSearchCache = { expiresAt: 0, rows: [] };
 
 app.use(cors({ origin: allowedOrigin === "*" ? true : allowedOrigin }));
@@ -35,7 +36,8 @@ app.get("/api/diagnostics", (_req, res) => {
     hasUsername: Boolean(cin7Username),
     hasApiKey: Boolean(cin7ApiKey),
     stockUpdateEnabled: Boolean(stockUpdatePin),
-    stockUpdateAutoApprove
+    stockUpdateAutoApprove,
+    cin7WriteTimeoutMs
   });
 });
 
@@ -431,15 +433,28 @@ async function cin7Get(path, params = {}) {
 async function cin7Send(method, path, body) {
   if (!cin7Username || !cin7ApiKey) throw new Error("Cin7 backend is missing CIN7_API_USERNAME or CIN7_API_KEY");
 
-  const response = await fetch(`${cin7BaseUrl}${path}`, {
-    method,
-    headers: {
-      "Accept": "application/json",
-      "Content-Type": "application/json",
-      "Authorization": `Basic ${Buffer.from(`${cin7Username}:${cin7ApiKey}`).toString("base64")}`
-    },
-    body: JSON.stringify(body)
-  });
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), cin7WriteTimeoutMs);
+  let response;
+  try {
+    response = await fetch(`${cin7BaseUrl}${path}`, {
+      method,
+      headers: {
+        "Accept": "application/json",
+        "Content-Type": "application/json",
+        "Authorization": `Basic ${Buffer.from(`${cin7Username}:${cin7ApiKey}`).toString("base64")}`
+      },
+      body: JSON.stringify(body),
+      signal: controller.signal
+    });
+  } catch (error) {
+    if (error.name === "AbortError") {
+      throw new Error(`Cin7 did not respond within ${Math.round(cin7WriteTimeoutMs / 1000)} seconds. Try fewer stocktake lines first.`);
+    }
+    throw error;
+  } finally {
+    clearTimeout(timeout);
+  }
 
   const json = await readJsonResponse(response, "Cin7 Omni API");
   if (!response.ok) {
