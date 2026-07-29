@@ -5,7 +5,7 @@ import express from "express";
 dotenv.config();
 
 const app = express();
-const connectorVersion = "2026-07-30-stock-update-job-v3";
+const connectorVersion = "2026-07-30-stock-update-debug-v4";
 const port = Number(process.env.PORT || 3000);
 const cin7Username = process.env.CIN7_API_USERNAME || "";
 const cin7ApiKey = process.env.CIN7_API_KEY || "";
@@ -197,7 +197,8 @@ app.post("/api/stocktake-adjustment", async (req, res) => {
       createdAt: new Date().toISOString(),
       completedAt: "",
       result: null,
-      error: ""
+      error: "",
+      request: adjustment
     };
     updateJobs.set(jobId, job);
     runStockUpdateJob(jobId, adjustment);
@@ -211,6 +212,25 @@ app.get("/api/stocktake-adjustment-status/:jobId", (req, res) => {
   const job = updateJobs.get(String(req.params.jobId || ""));
   if (!job) return res.status(404).json({ error: "Stock update job not found" });
   res.json({ ok: true, ...job });
+});
+
+app.get("/api/stocktake-adjustment-jobs", (_req, res) => {
+  res.json({
+    ok: true,
+    jobs: [...updateJobs.values()].slice(-20).map((job) => ({
+      id: job.id,
+      status: job.status,
+      reference: job.reference,
+      branchId: job.branchId,
+      branchName: job.branchName,
+      lineCount: job.lineCount,
+      adjustmentTotal: job.adjustmentTotal,
+      createdAt: job.createdAt,
+      completedAt: job.completedAt,
+      error: job.error,
+      result: job.result
+    }))
+  });
 });
 
 async function findStockRows(code) {
@@ -520,7 +540,7 @@ function stocktakeItemToAdjustmentLine(item, index) {
     code: String(item.sku || item.code || ""),
     name: String(item.name || ""),
     sort: index + 1,
-    qty: counted,
+    qty,
     qtyAdjusted: qty
   };
 }
