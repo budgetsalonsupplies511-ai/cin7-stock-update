@@ -5,15 +5,16 @@ import express from "express";
 dotenv.config();
 
 const app = express();
-const connectorVersion = "2026-07-30-direct-search-v5";
+const connectorVersion = "2026-07-30-name-search-pages-v6";
 const port = Number(process.env.PORT || 3000);
 const cin7Username = process.env.CIN7_API_USERNAME || "";
 const cin7ApiKey = process.env.CIN7_API_KEY || "";
 const cin7BaseUrl = (process.env.CIN7_API_BASE_URL || "https://api.cin7.com/api/v1").replace(/\/+$/, "");
 const allowedOrigin = process.env.ALLOWED_ORIGIN || "*";
 const searchCacheMs = 10 * 60 * 1000;
-const searchPageLimit = Number(process.env.CIN7_SEARCH_PAGE_LIMIT || 5);
+const searchPageLimit = Number(process.env.CIN7_SEARCH_PAGE_LIMIT || 100);
 const searchRowsPerPage = Number(process.env.CIN7_SEARCH_ROWS_PER_PAGE || 100);
+const searchRequestDelayMs = Number(process.env.CIN7_SEARCH_REQUEST_DELAY_MS || 300);
 const stockUpdatePin = process.env.CIN7_STOCK_UPDATE_PIN || "";
 const stockUpdateAutoApprove = String(process.env.CIN7_STOCK_UPDATE_AUTO_APPROVE || "true").toLowerCase() !== "false";
 const cin7WriteTimeoutMs = Number(process.env.CIN7_WRITE_TIMEOUT_MS || 55000);
@@ -38,7 +39,10 @@ app.get("/api/diagnostics", (_req, res) => {
     hasApiKey: Boolean(cin7ApiKey),
     stockUpdateEnabled: Boolean(stockUpdatePin),
     stockUpdateAutoApprove,
-    cin7WriteTimeoutMs
+    cin7WriteTimeoutMs,
+    searchPageLimit,
+    searchRowsPerPage,
+    searchRequestDelayMs
   });
 });
 
@@ -361,8 +365,13 @@ async function fetchProductPages(pageCount, rows, stopWhenShort = true) {
     if (!batch.length) break;
     pages.push(...batch);
     if (stopWhenShort && batch.length < rows) break;
+    if (page < pageCount) await sleep(searchRequestDelayMs);
   }
   return pages;
+}
+
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
 function searchWords(value) {
