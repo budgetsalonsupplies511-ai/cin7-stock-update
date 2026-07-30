@@ -5,7 +5,7 @@ import express from "express";
 dotenv.config();
 
 const app = express();
-const connectorVersion = "2026-07-30-name-search-pages-v6";
+const connectorVersion = "2026-07-30-flex-name-search-v7";
 const port = Number(process.env.PORT || 3000);
 const cin7Username = process.env.CIN7_API_USERNAME || "";
 const cin7ApiKey = process.env.CIN7_API_KEY || "";
@@ -80,11 +80,13 @@ app.get("/api/lookup", async (req, res) => {
     const productOptionId = stock.productOptionId ?? stock.ProductOptionId;
     const productId = stock.productId ?? stock.ProductId;
     const option = await getBestProductOption(productId, productOptionId, code);
+    const product = productId ? await getProduct(productId) : null;
     const name = buildProductName(stock, option);
     const selectedBranchId = stock.branchId ?? stock.BranchId ?? "";
     const selectedBranchName = stock.branchName ?? stock.BranchName ?? "";
     const stockOnHand = stock.stockOnHand ?? stock.StockOnHand ?? stock.available ?? stock.Available ?? "";
     const priceTiers = mergePriceTiers(extractPriceTiers(option, option), extractPriceTiers(stock, stock));
+    const imageUrl = imageUrlFrom(option, product, stock);
 
     res.json({
       barcode: stock.barcode ?? stock.Barcode ?? stock.productOptionBarcode ?? stock.ProductOptionBarcode ?? stock.productOptionSizeBarcode ?? stock.ProductOptionSizeBarcode ?? code,
@@ -92,6 +94,7 @@ app.get("/api/lookup", async (req, res) => {
       price: priceTiers.special || priceTiers.retail || "",
       priceSource: priceTiers.special ? "special" : "retail",
       priceTiers,
+      imageUrl,
       productTitle: name,
       variantTitle: "",
       productId: productId ?? "",
@@ -153,6 +156,36 @@ app.get("/api/debug-products", async (_req, res) => {
         name: product.name ?? product.Name ?? product.productName ?? product.ProductName ?? "",
         optionCount: asArray(product.productOptions ?? product.ProductOptions ?? product.options ?? product.Options).length
       }))
+    });
+  } catch (error) {
+    sendError(res, error);
+  }
+});
+
+app.get("/api/debug-search", async (req, res) => {
+  const query = String(req.query.q || "").trim();
+  if (query.length < 2) return res.status(400).json({ error: "Type at least 2 letters" });
+
+  try {
+    const products = await getCachedProducts();
+    const words = searchWords(query);
+    const matches = products
+      .filter((product) => matchesWords(searchTextForProduct(product), words))
+      .slice(0, 10)
+      .map((product) => ({
+        id: product.id ?? product.Id ?? product.ID,
+        name: product.name ?? product.Name ?? product.productName ?? product.ProductName ?? "",
+        text: searchTextForProduct(product).slice(0, 240)
+      }));
+
+    res.json({
+      ok: true,
+      query,
+      words,
+      normalisedQuery: normaliseSearchText(query),
+      productCount: products.length,
+      matchCount: matches.length,
+      matches
     });
   } catch (error) {
     sendError(res, error);
@@ -298,6 +331,7 @@ function searchResultFromOption(option, product = null) {
     price: priceTiers.special || priceTiers.retail || "",
     priceSource: priceTiers.special ? "special" : "retail",
     priceTiers,
+    imageUrl: imageUrlFrom(option, product),
     productTitle: name,
     variantTitle: "",
     productId: option.productId ?? option.ProductId ?? product?.id ?? product?.Id ?? product?.ID ?? "",
@@ -311,6 +345,7 @@ async function stockRowToSearchResult(stock) {
   const productOptionId = stock.productOptionId ?? stock.ProductOptionId;
   const productId = stock.productId ?? stock.ProductId;
   const option = await getBestProductOption(productId, productOptionId, barcodeValue(stock));
+  const product = productId ? await getProduct(productId) : null;
   const priceTiers = mergePriceTiers(extractPriceTiers(option, option), extractPriceTiers(stock, stock));
 
   return {
@@ -319,6 +354,7 @@ async function stockRowToSearchResult(stock) {
     price: priceTiers.special || priceTiers.retail || "",
     priceSource: priceTiers.special ? "special" : "retail",
     priceTiers,
+    imageUrl: imageUrlFrom(option, product, stock),
     productTitle: buildProductName(stock, option),
     variantTitle: "",
     productId: productId ?? option?.productId ?? option?.ProductId ?? "",
@@ -375,12 +411,21 @@ function sleep(ms) {
 }
 
 function searchWords(value) {
-  return String(value).toLowerCase().split(/\s+/).filter(Boolean);
+  return normaliseSearchText(value).split(/\s+/).filter(Boolean);
 }
 
 function matchesWords(text, words) {
-  const haystack = String(text || "").toLowerCase();
+  const haystack = normaliseSearchText(text);
   return words.every((word) => haystack.includes(word));
+}
+
+function normaliseSearchText(value) {
+  return String(value || "")
+    .toLowerCase()
+    .replace(/(\d)[./-](\d)/g, "$1$2")
+    .replace(/[^a-z0-9]+/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
 }
 
 function searchTextForProduct(product) {
@@ -738,6 +783,59 @@ function buildProductName(stock, option) {
     option?.size ?? option?.Size ?? stock.size ?? stock.Size
   ].filter(Boolean);
   return [base, parts.join(" / ")].filter(Boolean).join(" - ") || "Unnamed item";
+}
+
+function imageUrlFrom(...sources) {
+  const directFields = [
+    "imageUrl", "ImageUrl", "imageURL", "ImageURL",
+    "image", "Image", "photo", "Photo",
+    "photoUrl", "PhotoUrl", "photoURL", "PhotoURL",
+    "thumbnail", "Thumbnail", "thumbnailUrl", "ThumbnailUrl",
+    "thumbnailURL", "ThumbnailURL", "picture", "Picture",
+    "pictureUrl", "PictureUrl", "url", "URL"
+  ];
+  const arrayFields = [
+    "images", "Images", "productImages", "ProductImages",
+    "photos", "Photos", "attachments", "Attachments"
+  ];
+
+  const seen = new Set();
+  const find = (value, depth = 0) => {
+    if (!value || depth > 4) return "";
+    if (typeof value === "string") return normaliseImageUrl(value);
+    if (typeof value !== "object" || seen.has(value)) return "";
+    seen.add(value);
+
+    for (const field of directFields) {
+      const found = find(value[field], depth + 1);
+      if (found) return found;
+    }
+
+    for (const field of arrayFields) {
+      const rows = asArray(value[field]).slice(0, 8);
+      for (const row of rows) {
+        const found = find(row, depth + 1);
+        if (found) return found;
+      }
+    }
+
+    return "";
+  };
+
+  for (const source of sources) {
+    const found = find(source);
+    if (found) return found;
+  }
+  return "";
+}
+
+function normaliseImageUrl(value) {
+  const text = String(value || "").trim();
+  if (!text) return "";
+  if (text.startsWith("//")) return `https:${text}`;
+  if (/^https?:\/\//i.test(text)) return text;
+  if (/^data:image\//i.test(text)) return text;
+  return "";
 }
 
 function extractPriceTiers(option, stock) {
