@@ -5,7 +5,7 @@ import express from "express";
 dotenv.config();
 
 const app = express();
-const connectorVersion = "2026-07-30-flex-name-search-v7";
+const connectorVersion = "2026-07-30-flex-name-search-v8-image-proxy";
 const port = Number(process.env.PORT || 3000);
 const cin7Username = process.env.CIN7_API_USERNAME || "";
 const cin7ApiKey = process.env.CIN7_API_KEY || "";
@@ -146,6 +146,30 @@ app.get("/api/search-products", async (req, res) => {
   }
 });
 
+app.get("/api/image", async (req, res) => {
+  const rawUrl = String(req.query.url || "").trim();
+  const imageUrl = normaliseImageUrl(rawUrl);
+  if (!imageUrl) return res.status(400).send("Missing image URL");
+
+  try {
+    const response = await fetch(imageUrl, {
+      headers: {
+        "Accept": "image/*,*/*",
+        "Authorization": `Basic ${Buffer.from(`${cin7Username}:${cin7ApiKey}`).toString("base64")}`
+      }
+    });
+    if (!response.ok) return res.status(response.status).send("Image could not be loaded");
+
+    const contentType = response.headers.get("content-type") || "image/jpeg";
+    res.setHeader("Content-Type", contentType);
+    res.setHeader("Cache-Control", "public, max-age=86400");
+    const buffer = Buffer.from(await response.arrayBuffer());
+    res.send(buffer);
+  } catch (error) {
+    sendError(res, error);
+  }
+});
+
 app.get("/api/debug-products", async (_req, res) => {
   try {
     const products = await fetchProductPages(1, 10, false);
@@ -154,6 +178,8 @@ app.get("/api/debug-products", async (_req, res) => {
       products: products.slice(0, 5).map((product) => ({
         id: product.id ?? product.Id ?? product.ID,
         name: product.name ?? product.Name ?? product.productName ?? product.ProductName ?? "",
+        imageUrl: imageUrlFrom(product),
+        imageKeys: imageKeys(product),
         optionCount: asArray(product.productOptions ?? product.ProductOptions ?? product.options ?? product.Options).length
       }))
     });
@@ -716,11 +742,16 @@ async function debugStockSummary(row) {
   const productOptionId = row.productOptionId ?? row.ProductOptionId;
   const productId = row.productId ?? row.ProductId;
   const option = await getBestProductOption(productId, productOptionId, barcodeValue(row));
+  const product = productId ? await getProduct(productId) : null;
   const stockPrices = extractPriceTiers(row, row);
   const optionPrices = extractPriceTiers(option, option);
 
   return {
     ...stockSummary(row),
+    imageUrl: imageUrlFrom(option, product, row),
+    stockImageKeys: imageKeys(row),
+    optionImageKeys: imageKeys(option),
+    productImageKeys: imageKeys(product),
     optionPriceTiers: optionPrices,
     finalPriceTiers: mergePriceTiers(optionPrices, stockPrices),
     optionPriceKeys: option ? Object.keys(option).filter((key) => /price|freelance|freelancer|vip|wholesale|special/i.test(key)) : [],
@@ -788,15 +819,21 @@ function buildProductName(stock, option) {
 function imageUrlFrom(...sources) {
   const directFields = [
     "imageUrl", "ImageUrl", "imageURL", "ImageURL",
+    "imageLink", "ImageLink", "imageHref", "ImageHref",
     "image", "Image", "photo", "Photo",
     "photoUrl", "PhotoUrl", "photoURL", "PhotoURL",
+    "photoLink", "PhotoLink",
     "thumbnail", "Thumbnail", "thumbnailUrl", "ThumbnailUrl",
     "thumbnailURL", "ThumbnailURL", "picture", "Picture",
-    "pictureUrl", "PictureUrl", "url", "URL"
+    "pictureUrl", "PictureUrl", "src", "Src", "source", "Source",
+    "href", "Href", "link", "Link", "downloadUrl", "DownloadUrl",
+    "fileUrl", "FileUrl", "fileURL", "FileURL", "assetUrl", "AssetUrl",
+    "publicUrl", "PublicUrl", "secureUrl", "SecureUrl", "url", "URL"
   ];
   const arrayFields = [
     "images", "Images", "productImages", "ProductImages",
-    "photos", "Photos", "attachments", "Attachments"
+    "photos", "Photos", "attachments", "Attachments",
+    "files", "Files", "media", "Media", "assets", "Assets"
   ];
 
   const seen = new Set();
@@ -829,13 +866,22 @@ function imageUrlFrom(...sources) {
   return "";
 }
 
+function imageKeys(source) {
+  if (!source || typeof source !== "object") return [];
+  return Object.keys(source).filter((key) => /image|photo|picture|thumbnail|asset|attachment|media|file|url|link/i.test(key));
+}
+
 function normaliseImageUrl(value) {
   const text = String(value || "").trim();
   if (!text) return "";
   if (text.startsWith("//")) return `https:${text}`;
   if (/^https?:\/\//i.test(text)) return text;
   if (/^data:image\//i.test(text)) return text;
-  return "";
+  try {
+    return new URL(text.replace(/^\/+/, ""), `${cin7BaseUrl}/`).href;
+  } catch {
+    return "";
+  }
 }
 
 function extractPriceTiers(option, stock) {
