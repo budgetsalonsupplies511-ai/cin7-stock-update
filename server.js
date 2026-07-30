@@ -5,7 +5,7 @@ import express from "express";
 dotenv.config();
 
 const app = express();
-const connectorVersion = "2026-07-30-flex-name-search-v9-warm-cache";
+const connectorVersion = "2026-07-30-flex-name-search-v10-zero-stock";
 const port = Number(process.env.PORT || 3000);
 const cin7Username = process.env.CIN7_API_USERNAME || "";
 const cin7ApiKey = process.env.CIN7_API_KEY || "";
@@ -243,13 +243,20 @@ app.post("/api/stocktake-adjustment", async (req, res) => {
     const items = asArray(req.body.items);
     if (!Number.isFinite(branchId) || branchId <= 0) return res.status(400).json({ error: "Missing Cin7 branch" });
 
-    const lineItems = items
-      .map(stocktakeItemToAdjustmentLine)
-      .filter(Boolean)
+    const parsedLines = items.map(stocktakeItemToAdjustmentLine);
+    const skippedLines = parsedLines.filter((line) => !line.ok).map((line) => line.reason);
+    const lineItems = parsedLines
+      .filter((line) => line.ok)
+      .map((line) => line.line)
       .filter((line) => line.qty !== 0);
 
     if (!lineItems.length) {
-      return res.status(400).json({ error: "No valid stock differences to update" });
+      return res.status(400).json({
+        error: "No valid stock differences to update",
+        received: items.length,
+        skipped: skippedLines.slice(0, 10),
+        note: "A valid stock update needs Cin7 productOptionId, current stock, and counted stock. Counted 0 is valid when current stock is above 0."
+      });
     }
 
     const jobId = stocktakeReference();
@@ -724,23 +731,43 @@ function batchErrors(result) {
 }
 
 function stocktakeItemToAdjustmentLine(item, index) {
-  const counted = Number(item.countedQty ?? item.qty);
-  const current = Number(item.currentQty ?? item.expectedCount);
-  const productOptionId = Number(item.productOptionId);
+  const counted = numericValue(item.countedQty ?? item.qty);
+  const current = numericValue(item.currentQty ?? item.expectedCount);
+  const productOptionId = numericValue(item.productOptionId);
   const qty = counted - current;
 
   if (!Number.isFinite(counted) || !Number.isFinite(current) || !Number.isFinite(productOptionId) || productOptionId <= 0) {
-    return null;
+    return {
+      ok: false,
+      reason: {
+        code: item.code || "",
+        sku: item.sku || "",
+        name: item.name || "",
+        productOptionId: item.productOptionId ?? "",
+        currentQty: item.currentQty ?? item.expectedCount ?? "",
+        countedQty: item.countedQty ?? item.qty ?? "",
+        issue: "Missing product option, current stock, or counted stock"
+      }
+    };
   }
 
   return {
-    productOptionId,
-    code: String(item.sku || item.code || ""),
-    name: String(item.name || ""),
-    sort: index + 1,
-    qty,
-    qtyAdjusted: qty
+    ok: true,
+    line: {
+      productOptionId,
+      code: String(item.sku || item.code || ""),
+      name: String(item.name || ""),
+      sort: index + 1,
+      qty,
+      qtyAdjusted: qty
+    }
   };
+}
+
+function numericValue(value) {
+  if (value === "" || value === null || value === undefined) return NaN;
+  const number = Number(value);
+  return Number.isFinite(number) ? number : NaN;
 }
 
 function stocktakeReference() {
