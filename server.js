@@ -5,7 +5,7 @@ import express from "express";
 dotenv.config();
 
 const app = express();
-const connectorVersion = "2026-07-30-flex-name-search-v8-image-proxy";
+const connectorVersion = "2026-07-30-flex-name-search-v9-warm-cache";
 const port = Number(process.env.PORT || 3000);
 const cin7Username = process.env.CIN7_API_USERNAME || "";
 const cin7ApiKey = process.env.CIN7_API_KEY || "";
@@ -19,6 +19,7 @@ const stockUpdatePin = process.env.CIN7_STOCK_UPDATE_PIN || "";
 const stockUpdateAutoApprove = String(process.env.CIN7_STOCK_UPDATE_AUTO_APPROVE || "true").toLowerCase() !== "false";
 const cin7WriteTimeoutMs = Number(process.env.CIN7_WRITE_TIMEOUT_MS || 55000);
 let productSearchCache = { expiresAt: 0, rows: [] };
+let productSearchWarmup = null;
 const updateJobs = new Map();
 
 app.use(cors({ origin: allowedOrigin === "*" ? true : allowedOrigin }));
@@ -42,8 +43,22 @@ app.get("/api/diagnostics", (_req, res) => {
     cin7WriteTimeoutMs,
     searchPageLimit,
     searchRowsPerPage,
-    searchRequestDelayMs
+    searchRequestDelayMs,
+    searchCache: cacheStatus()
   });
+});
+
+app.get("/api/cache-status", (_req, res) => {
+  res.json({ ok: true, ...cacheStatus() });
+});
+
+app.post("/api/warm-cache", async (_req, res) => {
+  try {
+    const rows = await warmProductCache();
+    res.json({ ok: true, warmed: true, ...cacheStatus(), count: rows.length });
+  } catch (error) {
+    sendError(res, error);
+  }
 });
 
 app.get("/api/locations", async (_req, res) => {
@@ -415,9 +430,36 @@ async function getCachedProducts() {
   const now = Date.now();
   if (productSearchCache.expiresAt > now) return productSearchCache.rows;
 
-  const rows = await fetchProductPages(searchPageLimit, searchRowsPerPage, true);
-  productSearchCache = { expiresAt: now + searchCacheMs, rows };
+  const rows = await warmProductCache();
   return rows;
+}
+
+async function warmProductCache() {
+  const now = Date.now();
+  if (productSearchCache.expiresAt > now && productSearchCache.rows.length) return productSearchCache.rows;
+  if (productSearchWarmup) return productSearchWarmup;
+
+  productSearchWarmup = fetchProductPages(searchPageLimit, searchRowsPerPage, true)
+    .then((rows) => {
+      productSearchCache = { expiresAt: Date.now() + searchCacheMs, rows };
+      return rows;
+    })
+    .finally(() => {
+      productSearchWarmup = null;
+    });
+
+  return productSearchWarmup;
+}
+
+function cacheStatus() {
+  const now = Date.now();
+  return {
+    warm: productSearchCache.expiresAt > now && productSearchCache.rows.length > 0,
+    warming: Boolean(productSearchWarmup),
+    count: productSearchCache.rows.length,
+    expiresAt: productSearchCache.expiresAt ? new Date(productSearchCache.expiresAt).toISOString() : "",
+    expiresInSeconds: productSearchCache.expiresAt > now ? Math.round((productSearchCache.expiresAt - now) / 1000) : 0
+  };
 }
 
 async function fetchProductPages(pageCount, rows, stopWhenShort = true) {
