@@ -5,7 +5,7 @@ import express from "express";
 dotenv.config();
 
 const app = express();
-const connectorVersion = "2026-07-30-flex-name-search-v10-zero-stock";
+const connectorVersion = "2026-07-30-flex-name-search-v11-zero-stock-lookup";
 const port = Number(process.env.PORT || 3000);
 const cin7Username = process.env.CIN7_API_USERNAME || "";
 const cin7ApiKey = process.env.CIN7_API_KEY || "";
@@ -243,7 +243,7 @@ app.post("/api/stocktake-adjustment", async (req, res) => {
     const items = asArray(req.body.items);
     if (!Number.isFinite(branchId) || branchId <= 0) return res.status(400).json({ error: "Missing Cin7 branch" });
 
-    const parsedLines = items.map(stocktakeItemToAdjustmentLine);
+    const parsedLines = await Promise.all(items.map((item, index) => stocktakeItemToAdjustmentLine(item, index, branchId)));
     const skippedLines = parsedLines.filter((line) => !line.ok).map((line) => line.reason);
     const lineItems = parsedLines
       .filter((line) => line.ok)
@@ -730,10 +730,11 @@ function batchErrors(result) {
   return asArray(result).flatMap((row) => asArray(row.errors ?? row.Errors)).filter(Boolean);
 }
 
-function stocktakeItemToAdjustmentLine(item, index) {
+async function stocktakeItemToAdjustmentLine(item, index, branchId = "") {
+  const repaired = await repairStocktakeItem(item, branchId);
   const counted = numericValue(item.countedQty ?? item.qty);
-  const current = numericValue(item.currentQty ?? item.expectedCount);
-  const productOptionId = numericValue(item.productOptionId);
+  const current = numericValue(repaired.currentQty ?? repaired.expectedCount);
+  const productOptionId = numericValue(repaired.productOptionId);
   const qty = counted - current;
 
   if (!Number.isFinite(counted) || !Number.isFinite(current) || !Number.isFinite(productOptionId) || productOptionId <= 0) {
@@ -743,8 +744,8 @@ function stocktakeItemToAdjustmentLine(item, index) {
         code: item.code || "",
         sku: item.sku || "",
         name: item.name || "",
-        productOptionId: item.productOptionId ?? "",
-        currentQty: item.currentQty ?? item.expectedCount ?? "",
+        productOptionId: repaired.productOptionId ?? item.productOptionId ?? "",
+        currentQty: repaired.currentQty ?? repaired.expectedCount ?? item.currentQty ?? item.expectedCount ?? "",
         countedQty: item.countedQty ?? item.qty ?? "",
         issue: "Missing product option, current stock, or counted stock"
       }
@@ -762,6 +763,36 @@ function stocktakeItemToAdjustmentLine(item, index) {
       qtyAdjusted: qty
     }
   };
+}
+
+async function repairStocktakeItem(item, branchId = "") {
+  const current = numericValue(item.currentQty ?? item.expectedCount);
+  const productOptionId = numericValue(item.productOptionId);
+  if (Number.isFinite(current) && Number.isFinite(productOptionId) && productOptionId > 0) {
+    return item;
+  }
+
+  const lookupCode = String(item.code || item.barcode || item.sku || "").trim();
+  if (!lookupCode) return item;
+
+  try {
+    const lookup = await findStockRows(lookupCode);
+    const stock = chooseStockRow(lookup.rows, lookupCode, String(branchId || ""));
+    if (!stock) return item;
+
+    const repairedProductOptionId = stock.productOptionId ?? stock.ProductOptionId ?? item.productOptionId;
+    const stockOnHand = stock.stockOnHand ?? stock.StockOnHand ?? stock.available ?? stock.Available ?? item.currentQty ?? item.expectedCount;
+    return {
+      ...item,
+      productOptionId: repairedProductOptionId,
+      currentQty: stockOnHand,
+      expectedCount: stockOnHand,
+      sku: item.sku || stock.code || stock.Code || "",
+      name: item.name || stock.productName || stock.ProductName || ""
+    };
+  } catch {
+    return item;
+  }
 }
 
 function numericValue(value) {
