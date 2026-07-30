@@ -5,7 +5,7 @@ import express from "express";
 dotenv.config();
 
 const app = express();
-const connectorVersion = "2026-07-30-stock-update-debug-v4";
+const connectorVersion = "2026-07-30-direct-search-v5";
 const port = Number(process.env.PORT || 3000);
 const cin7Username = process.env.CIN7_API_USERNAME || "";
 const cin7ApiKey = process.env.CIN7_API_KEY || "";
@@ -246,8 +246,28 @@ async function findStockRows(code) {
 }
 
 async function searchProductsByName(query) {
+  const directMatches = await searchProductsDirect(query);
+  if (directMatches.length) return dedupeSearchResults(directMatches);
+
   const productMatches = await searchProducts(query);
   return dedupeSearchResults(productMatches);
+}
+
+async function searchProductsDirect(query) {
+  const directRows = [];
+
+  const lookup = await findStockRows(query);
+  if (lookup.rows.length) {
+    const rows = await Promise.all(lookup.rows.slice(0, 20).map(stockRowToSearchResult));
+    directRows.push(...rows);
+  }
+
+  const optionRows = await findProductOptionsBySku(query);
+  if (optionRows.length) {
+    directRows.push(...await Promise.all(optionRows.slice(0, 20).map(productOptionToSearchResult)));
+  }
+
+  return directRows;
 }
 
 async function searchProducts(query) {
@@ -281,6 +301,38 @@ function searchResultFromOption(option, product = null) {
     cin7Quantity: "",
     matchType: "name_search"
   };
+}
+
+async function stockRowToSearchResult(stock) {
+  const productOptionId = stock.productOptionId ?? stock.ProductOptionId;
+  const productId = stock.productId ?? stock.ProductId;
+  const option = await getBestProductOption(productId, productOptionId, barcodeValue(stock));
+  const priceTiers = mergePriceTiers(extractPriceTiers(option, option), extractPriceTiers(stock, stock));
+
+  return {
+    barcode: barcodeValue(stock) || barcodeValue(option),
+    sku: stock.code ?? stock.Code ?? option?.code ?? option?.Code ?? "",
+    price: priceTiers.special || priceTiers.retail || "",
+    priceSource: priceTiers.special ? "special" : "retail",
+    priceTiers,
+    productTitle: buildProductName(stock, option),
+    variantTitle: "",
+    productId: productId ?? option?.productId ?? option?.ProductId ?? "",
+    productOptionId: productOptionId ?? option?.id ?? option?.Id ?? option?.ID ?? "",
+    cin7Quantity: stock.stockOnHand ?? stock.StockOnHand ?? stock.available ?? stock.Available ?? "",
+    matchType: "direct_search"
+  };
+}
+
+async function productOptionToSearchResult(option) {
+  const productId = option.productId ?? option.ProductId;
+  const product = productId ? await getProduct(productId) : null;
+  const productName = product?.name ?? product?.Name ?? product?.productName ?? product?.ProductName ?? option.productName ?? option.ProductName ?? "";
+  return searchResultFromOption({
+    ...option,
+    productName,
+    productId
+  }, product);
 }
 
 function dedupeSearchResults(rows) {
@@ -409,6 +461,30 @@ async function findProductOptionsByBarcode(code) {
       }));
       const exact = rows.filter((row) => sameCode(barcodeValue(row), code));
       if (exact.length) return Promise.all(exact.map(productOptionToStockRow));
+    } catch {
+      // Cin7 accounts can expose different ProductOptions field names.
+    }
+  }
+
+  return [];
+}
+
+async function findProductOptionsBySku(sku) {
+  const fields = [
+    "code",
+    "Code",
+    "productOptionCode",
+    "ProductOptionCode"
+  ];
+
+  for (const field of fields) {
+    try {
+      const rows = asArray(await cin7Get("/ProductOptions", {
+        where: `${field}='${escapeWhereValue(sku)}'`,
+        rows: "20"
+      }));
+      const exact = rows.filter((row) => sameCode(row.code ?? row.Code ?? row.productOptionCode ?? row.ProductOptionCode, sku));
+      if (exact.length) return exact;
     } catch {
       // Cin7 accounts can expose different ProductOptions field names.
     }
