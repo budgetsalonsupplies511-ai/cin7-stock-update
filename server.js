@@ -5,7 +5,7 @@ import express from "express";
 dotenv.config();
 
 const app = express();
-const connectorVersion = "2026-07-30-flex-name-search-v11-zero-stock-lookup";
+const connectorVersion = "2026-07-31-force-product-name-v4";
 const port = Number(process.env.PORT || 3000);
 const cin7Username = process.env.CIN7_API_USERNAME || "";
 const cin7ApiKey = process.env.CIN7_API_KEY || "";
@@ -15,7 +15,9 @@ const searchCacheMs = 10 * 60 * 1000;
 const searchPageLimit = Number(process.env.CIN7_SEARCH_PAGE_LIMIT || 100);
 const searchRowsPerPage = Number(process.env.CIN7_SEARCH_ROWS_PER_PAGE || 100);
 const searchRequestDelayMs = Number(process.env.CIN7_SEARCH_REQUEST_DELAY_MS || 300);
+const cin7RetryAfterMs = Number(process.env.CIN7_RETRY_AFTER_MS || 10000);
 const stockUpdatePin = process.env.CIN7_STOCK_UPDATE_PIN || "";
+const branchTransferPin = process.env.CIN7_BRANCH_TRANSFER_PIN || stockUpdatePin;
 const stockUpdateAutoApprove = String(process.env.CIN7_STOCK_UPDATE_AUTO_APPROVE || "true").toLowerCase() !== "false";
 const cin7WriteTimeoutMs = Number(process.env.CIN7_WRITE_TIMEOUT_MS || 55000);
 let productSearchCache = { expiresAt: 0, rows: [] };
@@ -39,11 +41,13 @@ app.get("/api/diagnostics", (_req, res) => {
     hasUsername: Boolean(cin7Username),
     hasApiKey: Boolean(cin7ApiKey),
     stockUpdateEnabled: Boolean(stockUpdatePin),
+    branchTransferEnabled: Boolean(branchTransferPin),
     stockUpdateAutoApprove,
     cin7WriteTimeoutMs,
     searchPageLimit,
     searchRowsPerPage,
     searchRequestDelayMs,
+    cin7RetryAfterMs,
     searchCache: cacheStatus()
   });
 });
@@ -96,7 +100,7 @@ app.get("/api/lookup", async (req, res) => {
     const productId = stock.productId ?? stock.ProductId;
     const option = await getBestProductOption(productId, productOptionId, code);
     const product = productId ? await getProduct(productId) : null;
-    const name = buildProductName(stock, option);
+    const name = buildProductName(stock, option, product);
     const selectedBranchId = stock.branchId ?? stock.BranchId ?? "";
     const selectedBranchName = stock.branchName ?? stock.BranchName ?? "";
     const stockOnHand = stock.stockOnHand ?? stock.StockOnHand ?? stock.available ?? stock.Available ?? "";
@@ -318,6 +322,67 @@ app.get("/api/stocktake-adjustment-jobs", (_req, res) => {
   });
 });
 
+app.post("/api/branch-transfer", async (req, res) => {
+  try {
+    if (!branchTransferPin) return res.status(403).json({ error: "Cin7 branch transfer is not enabled on this backend" });
+    if (String(req.body.pin || "") !== branchTransferPin) return res.status(401).json({ error: "Wrong transfer PIN" });
+
+    const sourceBranchId = Number(req.body.sourceBranchId);
+    const destinationBranchId = Number(req.body.destinationBranchId);
+    const sourceBranchName = String(req.body.sourceBranchName || "");
+    const destinationBranchName = String(req.body.destinationBranchName || "");
+    const mode = String(req.body.mode || "draft").toLowerCase();
+    const items = asArray(req.body.items);
+
+    if (!Number.isFinite(sourceBranchId) || sourceBranchId <= 0) return res.status(400).json({ error: "Missing source branch" });
+    if (!Number.isFinite(destinationBranchId) || destinationBranchId <= 0) return res.status(400).json({ error: "Missing destination branch" });
+    if (sourceBranchId === destinationBranchId) return res.status(400).json({ error: "Source and destination branch must be different" });
+
+    const lineItems = items
+      .map((item, index) => branchTransferLine(item, index))
+      .filter(Boolean);
+
+    if (!lineItems.length) {
+      return res.status(400).json({
+        error: "No valid products to transfer",
+        received: items.length,
+        note: "A valid transfer line needs a quantity and either a Cin7 product option id or SKU."
+      });
+    }
+
+    const now = new Date().toISOString();
+    const reference = branchTransferReference();
+    const transfer = {
+      isApproved: mode !== "draft",
+      reference,
+      sourceBranchId,
+      destinationBranchId,
+      source: "BSS Scanner",
+      internalComments: `Branch transfer${sourceBranchName || destinationBranchName ? ` from ${sourceBranchName || sourceBranchId} to ${destinationBranchName || destinationBranchId}` : ""}`,
+      lineItems
+    };
+
+    if (mode === "dispatch" || mode === "receive") {
+      transfer.approvalDate = now;
+      transfer.dispatchedDate = now;
+    }
+    if (mode === "receive") transfer.receivedDate = now;
+
+    const result = await cin7Send("POST", "/BranchTransfers", [transfer]);
+    const success = adjustmentSucceeded(result);
+    res.status(success ? 200 : 400).json({
+      ok: success,
+      reference,
+      mode,
+      lineCount: lineItems.length,
+      result,
+      error: success ? "" : batchErrors(result).join("; ") || "Cin7 rejected the branch transfer"
+    });
+  } catch (error) {
+    sendError(res, error);
+  }
+});
+
 async function findStockRows(code) {
   const byBarcode = asArray(await cin7Get(`/Stock/${encodeURIComponent(code)}`));
   const exactBarcode = byBarcode.filter((row) => sameCode(barcodeValue(row), code));
@@ -331,11 +396,15 @@ async function findStockRows(code) {
 }
 
 async function searchProductsByName(query) {
-  const directMatches = await searchProductsDirect(query);
-  if (directMatches.length) return dedupeSearchResults(directMatches);
-
   const productMatches = await searchProducts(query);
-  return dedupeSearchResults(productMatches);
+  if (productMatches.length) return dedupeSearchResults(productMatches);
+
+  if (productSearchWarmup) {
+    return [];
+  }
+
+  const directMatches = await searchProductsDirect(query);
+  return dedupeSearchResults(directMatches);
 }
 
 async function searchProductsDirect(query) {
@@ -361,7 +430,7 @@ async function searchProducts(query) {
   return products
     .filter((product) => matchesWords(searchTextForProduct(product), words))
     .flatMap((product) => {
-      const productName = product.name ?? product.Name ?? product.productName ?? product.ProductName ?? "";
+      const productName = productNameFrom(product);
       const productId = product.id ?? product.Id ?? product.ID;
       const options = asArray(product.productOptions ?? product.ProductOptions ?? product.options ?? product.Options);
       if (!options.length) return [searchResultFromOption({ productName, productId }, product)];
@@ -372,7 +441,7 @@ async function searchProducts(query) {
 
 function searchResultFromOption(option, product = null) {
   const priceTiers = extractPriceTiers(option, option);
-  const name = buildProductName(option, option);
+  const name = buildProductName(option, option, product);
   return {
     barcode: barcodeValue(option),
     sku: option.code ?? option.Code ?? option.productOptionCode ?? option.ProductOptionCode ?? "",
@@ -403,7 +472,7 @@ async function stockRowToSearchResult(stock) {
     priceSource: priceTiers.special ? "special" : "retail",
     priceTiers,
     imageUrl: imageUrlFrom(option, product, stock),
-    productTitle: buildProductName(stock, option),
+    productTitle: buildProductName(stock, option, product),
     variantTitle: "",
     productId: productId ?? option?.productId ?? option?.ProductId ?? "",
     productOptionId: productOptionId ?? option?.id ?? option?.Id ?? option?.ID ?? "",
@@ -415,7 +484,7 @@ async function stockRowToSearchResult(stock) {
 async function productOptionToSearchResult(option) {
   const productId = option.productId ?? option.ProductId;
   const product = productId ? await getProduct(productId) : null;
-  const productName = product?.name ?? product?.Name ?? product?.productName ?? product?.ProductName ?? option.productName ?? option.ProductName ?? "";
+  const productName = productNameFrom(product) || productNameFrom(option);
   return searchResultFromOption({
     ...option,
     productName,
@@ -510,6 +579,10 @@ function searchTextForProduct(product) {
     product.Name,
     product.productName,
     product.ProductName,
+    product.productTitle,
+    product.ProductTitle,
+    product.description,
+    product.Description,
     product.code,
     product.Code,
     product.sku,
@@ -522,8 +595,12 @@ function searchTextForProductOption(option) {
   return [
     option.productName,
     option.ProductName,
+    option.productTitle,
+    option.ProductTitle,
     option.name,
     option.Name,
+    option.description,
+    option.Description,
     option.option1,
     option.Option1,
     option.option2,
@@ -653,12 +730,16 @@ async function cin7Get(path, params = {}) {
     if (value !== "" && value !== null && value !== undefined) url.searchParams.set(key, value);
   }
 
-  const response = await fetch(url, {
-    headers: {
-      "Accept": "application/json",
-      "Authorization": `Basic ${Buffer.from(`${cin7Username}:${cin7ApiKey}`).toString("base64")}`
-    }
+  let response = await fetch(url, {
+    headers: cin7Headers()
   });
+
+  if (response.status === 429) {
+    await sleep(cin7RetryAfterMs);
+    response = await fetch(url, {
+      headers: cin7Headers()
+    });
+  }
 
   const json = await readJsonResponse(response, "Cin7 Omni API");
   if (!response.ok) {
@@ -678,9 +759,8 @@ async function cin7Send(method, path, body) {
     response = await fetch(`${cin7BaseUrl}${path}`, {
       method,
       headers: {
-        "Accept": "application/json",
+        ...cin7Headers(),
         "Content-Type": "application/json",
-        "Authorization": `Basic ${Buffer.from(`${cin7Username}:${cin7ApiKey}`).toString("base64")}`
       },
       body: JSON.stringify(body),
       signal: controller.signal
@@ -700,6 +780,13 @@ async function cin7Send(method, path, body) {
     throw new Error(message);
   }
   return json;
+}
+
+function cin7Headers() {
+  return {
+    "Accept": "application/json",
+    "Authorization": `Basic ${Buffer.from(`${cin7Username}:${cin7ApiKey}`).toString("base64")}`
+  };
 }
 
 async function runStockUpdateJob(jobId, adjustment) {
@@ -801,9 +888,30 @@ function numericValue(value) {
   return Number.isFinite(number) ? number : NaN;
 }
 
+function branchTransferLine(item, index) {
+  const qty = numericValue(item.qty ?? item.quantity);
+  const productOptionId = numericValue(item.productOptionId);
+  const code = String(item.sku || item.code || item.barcode || "").trim();
+  if (!Number.isFinite(qty) || qty <= 0 || (!Number.isFinite(productOptionId) && !code)) return null;
+
+  const line = {
+    code,
+    name: String(item.name || item.productTitle || ""),
+    sort: index + 1,
+    qty
+  };
+  if (Number.isFinite(productOptionId) && productOptionId > 0) line.productOptionId = productOptionId;
+  return line;
+}
+
 function stocktakeReference() {
   const stamp = new Date().toISOString().replace(/[-:TZ.]/g, "").slice(2, 14);
   return `STK-${stamp}`.slice(0, 20);
+}
+
+function branchTransferReference() {
+  const stamp = new Date().toISOString().replace(/[-:TZ.]/g, "").slice(2, 14);
+  return `BTR-${stamp}`.slice(0, 20);
 }
 
 async function readJsonResponse(response, source) {
@@ -905,15 +1013,49 @@ function normaliseLookupCode(value) {
   return String(value ?? "").trim().replace(/\s+/g, " ");
 }
 
-function buildProductName(stock, option) {
-  const base = stock.productName ?? stock.ProductName ?? "";
+function buildProductName(stock, option, product = null) {
+  const base = productNameFrom(stock, option, product);
   const parts = [
+    option?.name ?? option?.Name,
+    option?.label ?? option?.Label,
+    option?.title ?? option?.Title,
     option?.option1 ?? option?.Option1 ?? stock.option1 ?? stock.Option1,
     option?.option2 ?? option?.Option2 ?? stock.option2 ?? stock.Option2,
     option?.option3 ?? option?.Option3 ?? stock.option3 ?? stock.Option3,
     option?.size ?? option?.Size ?? stock.size ?? stock.Size
-  ].filter(Boolean);
-  return [base, parts.join(" / ")].filter(Boolean).join(" - ") || "Unnamed item";
+  ].filter((part) => cleanName(part) && cleanName(part) !== cleanName(base));
+  return [base, parts.join(" / ")].filter(Boolean).join(" - ") || skuValue(stock) || skuValue(option) || barcodeValue(stock) || barcodeValue(option) || "Unnamed item";
+}
+
+function productNameFrom(...sources) {
+  for (const source of sources) {
+    const name = [
+      source?.productName,
+      source?.ProductName,
+      source?.productTitle,
+      source?.ProductTitle,
+      source?.name,
+      source?.Name,
+      source?.title,
+      source?.Title,
+      source?.label,
+      source?.Label,
+      source?.description,
+      source?.Description
+    ].map(cleanName).find(Boolean);
+    if (name) return name;
+  }
+  return "";
+}
+
+function cleanName(value) {
+  const text = String(value ?? "").trim();
+  if (!text || /^untitled$/i.test(text) || /^unnamed/i.test(text)) return "";
+  return text;
+}
+
+function skuValue(row) {
+  return row?.sku ?? row?.SKU ?? row?.code ?? row?.Code ?? row?.productOptionCode ?? row?.ProductOptionCode ?? "";
 }
 
 function imageUrlFrom(...sources) {
