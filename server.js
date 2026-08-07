@@ -26,6 +26,7 @@ const updateJobs = new Map();
 const reportPageLimit = Number(process.env.CIN7_REPORT_PAGE_LIMIT || 20);
 const reportCacheMs = Number(process.env.CIN7_REPORT_CACHE_MS || 5 * 60 * 1000);
 let stockCheckCatalogCache = { expiresAt: 0, value: null };
+let stockCheckProductsCache = { expiresAt: 0, rows: [] };
 
 app.use(cors({ origin: allowedOrigin === "*" ? true : allowedOrigin }));
 app.use(express.json({ limit: "10mb" }));
@@ -95,10 +96,8 @@ app.get("/api/stock-check/filters", async (_req, res) => {
       return res.json(stockCheckCatalogCache.value);
     }
 
-    const [products, purchaseOrders] = await Promise.all([
-      getCachedProducts(),
-      fetchAllPages("/PurchaseOrders", { order: "CreatedDate DESC" }, 4)
-    ]);
+    const products = await getStockCheckProducts();
+    const purchaseOrders = await fetchAllPages("/PurchaseOrders", { order: "CreatedDate DESC" }, 2);
     const supplierNames = new Map();
     for (const order of purchaseOrders) {
       const id = valueOf(order, "MemberId", "SupplierId");
@@ -131,7 +130,7 @@ app.get("/api/stock-check/report", async (req, res) => {
   }
 
   try {
-    const products = await getCachedProducts();
+    const products = await getStockCheckProducts();
     const matchingProducts = products.filter((product) => filterType === "brand"
       ? sameText(valueOf(product, "Brand"), filterValue)
       : String(valueOf(product, "SupplierId")) === filterValue);
@@ -156,12 +155,10 @@ app.get("/api/stock-check/report", async (req, res) => {
     }
     const startIso = startDate.toISOString();
 
-    const [stockRows, purchaseOrders, salesOrders, transfers] = await Promise.all([
-      fetchAllPages("/Stock", { where: `branchId=${Number(branchId)}` }),
-      fetchAllPages("/PurchaseOrders", { where: `modifiedDate>='${startIso}'`, order: "ModifiedDate DESC" }),
-      fetchAllPages("/SalesOrders", { where: `modifiedDate>='${startIso}'`, order: "ModifiedDate DESC" }),
-      fetchAllPages("/BranchTransfers", { where: `modifiedDate>='${startIso}'`, order: "ModifiedDate DESC" })
-    ]);
+    const stockRows = await fetchAllPages("/Stock", { where: `branchId=${Number(branchId)}` });
+    const purchaseOrders = await fetchAllPages("/PurchaseOrders", { where: `modifiedDate>='${startIso}'`, order: "ModifiedDate DESC" });
+    const salesOrders = await fetchAllPages("/SalesOrders", { where: `modifiedDate>='${startIso}'`, order: "ModifiedDate DESC" });
+    const transfers = await fetchAllPages("/BranchTransfers", { where: `modifiedDate>='${startIso}'`, order: "ModifiedDate DESC" });
 
     const metrics = new Map(variants.map((variant) => [variant.key, { cameIn: 0, sold: 0, transferIn: 0, transferOut: 0 }]));
     const addLines = (orders, field, quantityFields, dateFields, branchTest) => {
@@ -1322,8 +1319,17 @@ async function fetchAllPages(path, params = {}, maxPages = reportPageLimit) {
     const batch = asArray(await cin7Get(path, { ...params, page: String(page), rows: "250" }));
     rows.push(...batch);
     if (batch.length < 250) break;
-    await sleep(Math.max(350, searchRequestDelayMs));
+    await sleep(Math.max(1250, searchRequestDelayMs));
   }
+  return rows;
+}
+
+async function getStockCheckProducts() {
+  if (stockCheckProductsCache.expiresAt > Date.now() && stockCheckProductsCache.rows.length) {
+    return stockCheckProductsCache.rows;
+  }
+  const rows = await fetchAllPages("/Products", {}, reportPageLimit);
+  stockCheckProductsCache = { expiresAt: Date.now() + reportCacheMs, rows };
   return rows;
 }
 
