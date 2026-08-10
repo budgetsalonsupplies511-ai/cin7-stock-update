@@ -5,7 +5,7 @@ import express from "express";
 dotenv.config();
 
 const app = express();
-const connectorVersion = "2026-08-01-startup-product-cache-v1";
+const connectorVersion = "2026-08-10-zero-stock-product-option-v3";
 const port = Number(process.env.PORT || 3000);
 const cin7Username = process.env.CIN7_API_USERNAME || "";
 const cin7ApiKey = process.env.CIN7_API_KEY || "";
@@ -940,10 +940,12 @@ async function repairStocktakeItem(item, branchId = "") {
   const lookupCodes = [...new Set([item.barcode, item.sku, item.code]
     .map((value) => String(value || "").trim())
     .filter(Boolean))];
-  if (!lookupCodes.length) return item;
+  if (!lookupCodes.length && (!Number.isFinite(productOptionId) || productOptionId <= 0)) return item;
 
   try {
-    let stock = null;
+    let stock = Number.isFinite(productOptionId) && productOptionId > 0
+      ? await findStockByProductOptionId(productOptionId, branchId)
+      : null;
     for (const lookupCode of lookupCodes) {
       const lookup = await findStockRows(lookupCode);
       stock = chooseStockRow(lookup.rows, lookupCode, String(branchId || ""));
@@ -964,6 +966,17 @@ async function repairStocktakeItem(item, branchId = "") {
   } catch {
     return item;
   }
+}
+
+async function findStockByProductOptionId(productOptionId, branchId = "") {
+  const clauses = [`productOptionId=${Number(productOptionId)}`];
+  const numericBranchId = numericValue(branchId);
+  if (Number.isFinite(numericBranchId) && numericBranchId > 0) clauses.push(`branchId=${numericBranchId}`);
+  const rows = asArray(await cin7Get("/Stock", { where: clauses.join(" AND "), rows: "20" }));
+  return rows.find((row) =>
+    Number(row.productOptionId ?? row.ProductOptionId) === Number(productOptionId) &&
+    (!branchId || String(row.branchId ?? row.BranchId) === String(branchId))
+  ) || null;
 }
 
 function numericValue(value) {
