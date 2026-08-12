@@ -5,7 +5,7 @@ import express from "express";
 dotenv.config();
 
 const app = express();
-const connectorVersion = "2026-08-10-async-stock-preparation-v4";
+const connectorVersion = "2026-08-13-stock-check-report-v5";
 const port = Number(process.env.PORT || 3000);
 const cin7Username = process.env.CIN7_API_USERNAME || "";
 const cin7ApiKey = process.env.CIN7_API_KEY || "";
@@ -107,11 +107,13 @@ app.get("/api/stock-check/filters", async (_req, res) => {
 
     const brands = uniqueSorted(products.map((product) => valueOf(product, "Brand")).filter(Boolean))
       .map((name) => ({ id: name, name }));
+    const categories = uniqueSorted(products.map(productCategory).filter(Boolean))
+      .map((name) => ({ id: name, name }));
     const supplierIds = new Set(products.map((product) => valueOf(product, "SupplierId")).filter((id) => id !== "").map(String));
     const suppliers = [...supplierIds]
       .map((id) => ({ id, name: supplierNames.get(id) || `Supplier ${id}` }))
       .sort((left, right) => left.name.localeCompare(right.name, undefined, { sensitivity: "base" }));
-    const value = { brands, suppliers, generatedAt: new Date().toISOString() };
+    const value = { brands, categories, suppliers, generatedAt: new Date().toISOString() };
     stockCheckCatalogCache = { expiresAt: Date.now() + reportCacheMs, value };
     res.json(value);
   } catch (error) {
@@ -159,15 +161,18 @@ app.get("/api/stock-check/report", async (req, res) => {
   const filterValue = String(req.query.filterValue || "").trim();
   const range = String(req.query.range || "1").trim();
   if (!branchId) return res.status(400).json({ error: "Select a branch" });
-  if (!filterValue || !["brand", "supplier"].includes(filterType)) {
-    return res.status(400).json({ error: "Select a brand or supplier" });
+  if (!["all", "brand", "category", "supplier"].includes(filterType) || (filterType !== "all" && !filterValue)) {
+    return res.status(400).json({ error: "Select a valid product group" });
   }
 
   try {
     const products = await getStockCheckProducts();
-    const matchingProducts = products.filter((product) => filterType === "brand"
-      ? sameText(valueOf(product, "Brand"), filterValue)
-      : String(valueOf(product, "SupplierId")) === filterValue);
+    const matchingProducts = products.filter((product) => {
+      if (filterType === "all") return true;
+      if (filterType === "brand") return sameText(valueOf(product, "Brand"), filterValue);
+      if (filterType === "category") return sameText(productCategory(product), filterValue);
+      return String(valueOf(product, "SupplierId")) === filterValue;
+    });
     const variants = flattenProductVariants(matchingProducts);
     const productIds = new Set(matchingProducts.map((product) => String(valueOf(product, "Id"))).filter(Boolean));
     const optionIds = new Set(variants.map((variant) => String(variant.productOptionId)).filter(Boolean));
@@ -189,12 +194,15 @@ app.get("/api/stock-check/report", async (req, res) => {
     }
     const startIso = startDate.toISOString();
 
-    const stockRows = await fetchAllPages("/Stock", { where: `branchId=${Number(branchId)}` });
-    const purchaseOrders = await fetchAllPages("/PurchaseOrders", { where: `modifiedDate>='${startIso}'`, order: "ModifiedDate DESC" });
-    const salesOrders = await fetchAllPages("/SalesOrders", { where: `modifiedDate>='${startIso}'`, order: "ModifiedDate DESC" });
-    const transfers = await fetchAllPages("/BranchTransfers", { where: `modifiedDate>='${startIso}'`, order: "ModifiedDate DESC" });
+    const [stockRows, purchaseOrders, salesOrders, transfers, branches] = await Promise.all([
+      fetchAllPages("/Stock"),
+      fetchAllPages("/PurchaseOrders", { where: `modifiedDate>='${startIso}'`, order: "ModifiedDate DESC" }),
+      fetchAllPages("/SalesOrders", { where: `modifiedDate>='${startIso}'`, order: "ModifiedDate DESC" }),
+      fetchAllPages("/BranchTransfers", { where: `modifiedDate>='${startIso}'`, order: "ModifiedDate DESC" }),
+      cin7Get("/Branches", { fields: "id,company,isActive", rows: "250" })
+    ]);
 
-    const metrics = new Map(variants.map((variant) => [variant.key, { cameIn: 0, sold: 0, transferIn: 0, transferOut: 0 }]));
+    const metrics = new Map(variants.map((variant) => [variant.key, { cameIn: 0, sold: 0, transferIn: 0, transferOut: 0, lastSoldDate: "", lastPurchasedDate: "" }]));
     const addLines = (orders, field, quantityFields, dateFields, branchTest) => {
       for (const order of orders) {
         if (isVoidTransaction(order) || !branchTest(order)) continue;
@@ -203,7 +211,10 @@ app.get("/api/stock-check/report", async (req, res) => {
         for (const line of asArray(valueOf(order, "LineItems"))) {
           const key = variantKeyForLine(line, productIds, optionIds, codes, variants);
           if (!key || !metrics.has(key)) continue;
-          metrics.get(key)[field] += reportNumber(line, ...quantityFields);
+          const metric = metrics.get(key);
+          metric[field] += reportNumber(line, ...quantityFields);
+          if (field === "sold" && (!metric.lastSoldDate || date > new Date(metric.lastSoldDate))) metric.lastSoldDate = date.toISOString();
+          if (field === "cameIn" && (!metric.lastPurchasedDate || date > new Date(metric.lastPurchasedDate))) metric.lastPurchasedDate = date.toISOString();
         }
       }
     };
@@ -212,15 +223,20 @@ app.get("/api/stock-check/report", async (req, res) => {
     addLines(transfers, "transferIn", ["QtyTransferred"], ["ReceivedDate"], (order) => String(valueOf(order, "DestinationBranchId")) === branchId);
     addLines(transfers, "transferOut", ["QtyTransferred"], ["DispatchedDate"], (order) => String(valueOf(order, "SourceBranchId")) === branchId);
 
+    const activeBranches = asArray(branches).filter((branch) => valueOf(branch, "IsActive") !== false)
+      .map((branch) => ({ id: String(valueOf(branch, "Id")), name: String(valueOf(branch, "Company") || `Branch ${valueOf(branch, "Id")}`) }));
     const stockByKey = new Map();
     for (const stock of stockRows) {
       const key = variantKeyForLine(stock, productIds, optionIds, codes, variants);
-      if (key) stockByKey.set(key, reportNumber(stock, "StockOnHand", "Available"));
+      if (!key) continue;
+      if (!stockByKey.has(key)) stockByKey.set(key, {});
+      stockByKey.get(key)[String(valueOf(stock, "BranchId"))] = reportNumber(stock, "StockOnHand", "Available");
     }
     const rows = variants.map((variant) => ({
       ...variant,
       ...metrics.get(variant.key),
-      remaining: stockByKey.get(variant.key) ?? 0
+      remaining: stockByKey.get(variant.key)?.[branchId] ?? 0,
+      branchStock: stockByKey.get(variant.key) || {}
     })).sort((left, right) => left.name.localeCompare(right.name) || left.sku.localeCompare(right.sku));
 
     res.json({
@@ -234,6 +250,7 @@ app.get("/api/stock-check/report", async (req, res) => {
         reference: valueOf(lastPurchaseOrder, "Reference"),
         date: (transactionDate(lastPurchaseOrder, "FullyReceivedDate", "CreatedDate") || startDate).toISOString()
       } : null,
+      branches: activeBranches,
       rows,
       totals: rows.reduce((total, row) => ({
         cameIn: total.cameIn + row.cameIn,
@@ -1430,6 +1447,10 @@ function sameText(left, right) {
   return String(left || "").trim().localeCompare(String(right || "").trim(), undefined, { sensitivity: "base" }) === 0;
 }
 
+function productCategory(product) {
+  return String(valueOf(product, "Category", "ProductType", "Type", "Department") || "Uncategorised").trim();
+}
+
 function monthsAgo(months) {
   const date = new Date();
   date.setUTCMonth(date.getUTCMonth() - months);
@@ -1471,6 +1492,7 @@ function flattenProductVariants(products) {
         name: optionParts.length ? `${productName} - ${optionParts.join(" / ")}` : productName,
         barcode: String(valueOf(option, "ProductOptionBarcode", "Barcode")),
         brand: String(valueOf(product, "Brand")),
+        category: productCategory(product),
         supplierId: String(valueOf(product, "SupplierId"))
       });
     }
