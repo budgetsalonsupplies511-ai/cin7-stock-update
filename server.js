@@ -5,13 +5,13 @@ import express from "express";
 dotenv.config();
 
 const app = express();
-const connectorVersion = "2026-08-10-zero-stock-product-option-v3";
+const connectorVersion = "2026-08-10-async-stock-preparation-v4";
 const port = Number(process.env.PORT || 3000);
 const cin7Username = process.env.CIN7_API_USERNAME || "";
 const cin7ApiKey = process.env.CIN7_API_KEY || "";
 const cin7BaseUrl = (process.env.CIN7_API_BASE_URL || "https://api.cin7.com/api/v1").replace(/\/+$/, "");
 const allowedOrigin = process.env.ALLOWED_ORIGIN || "*";
-const searchCacheMs = Number(process.env.CIN7_SEARCH_CACHE_MS || 60 * 60 * 1000);
+const searchCacheMs = 10 * 60 * 1000;
 const searchPageLimit = Number(process.env.CIN7_SEARCH_PAGE_LIMIT || 100);
 const searchRowsPerPage = Number(process.env.CIN7_SEARCH_ROWS_PER_PAGE || 100);
 const searchRequestDelayMs = Number(process.env.CIN7_SEARCH_REQUEST_DELAY_MS || 300);
@@ -20,9 +20,13 @@ const stockUpdatePin = process.env.CIN7_STOCK_UPDATE_PIN || "";
 const branchTransferPin = process.env.CIN7_BRANCH_TRANSFER_PIN || stockUpdatePin;
 const stockUpdateAutoApprove = String(process.env.CIN7_STOCK_UPDATE_AUTO_APPROVE || "true").toLowerCase() !== "false";
 const cin7WriteTimeoutMs = Number(process.env.CIN7_WRITE_TIMEOUT_MS || 55000);
-let productSearchCache = emptyProductSearchCache();
+let productSearchCache = { expiresAt: 0, rows: [] };
 let productSearchWarmup = null;
 const updateJobs = new Map();
+const reportPageLimit = Number(process.env.CIN7_REPORT_PAGE_LIMIT || 20);
+const reportCacheMs = Number(process.env.CIN7_REPORT_CACHE_MS || 5 * 60 * 1000);
+let stockCheckCatalogCache = { expiresAt: 0, value: null };
+let stockCheckProductsCache = { expiresAt: 0, rows: [] };
 
 app.use(cors({ origin: allowedOrigin === "*" ? true : allowedOrigin }));
 app.use(express.json({ limit: "10mb" }));
@@ -86,59 +90,206 @@ app.get("/api/locations", async (_req, res) => {
   }
 });
 
+app.get("/api/stock-check/filters", async (_req, res) => {
+  try {
+    if (stockCheckCatalogCache.expiresAt > Date.now() && stockCheckCatalogCache.value) {
+      return res.json(stockCheckCatalogCache.value);
+    }
+
+    const products = await getStockCheckProducts();
+    const purchaseOrders = await fetchAllPages("/PurchaseOrders", { order: "CreatedDate DESC" }, 2);
+    const supplierNames = new Map();
+    for (const order of purchaseOrders) {
+      const id = valueOf(order, "MemberId", "SupplierId");
+      const name = valueOf(order, "Company", "SupplierName");
+      if (id !== "" && name) supplierNames.set(String(id), String(name));
+    }
+
+    const brands = uniqueSorted(products.map((product) => valueOf(product, "Brand")).filter(Boolean))
+      .map((name) => ({ id: name, name }));
+    const supplierIds = new Set(products.map((product) => valueOf(product, "SupplierId")).filter((id) => id !== "").map(String));
+    const suppliers = [...supplierIds]
+      .map((id) => ({ id, name: supplierNames.get(id) || `Supplier ${id}` }))
+      .sort((left, right) => left.name.localeCompare(right.name, undefined, { sensitivity: "base" }));
+    const value = { brands, suppliers, generatedAt: new Date().toISOString() };
+    stockCheckCatalogCache = { expiresAt: Date.now() + reportCacheMs, value };
+    res.json(value);
+  } catch (error) {
+    sendError(res, error);
+  }
+});
+
+app.get("/api/stock-check/suppliers", async (req, res) => {
+  const query = String(req.query.q || "").trim();
+  if (query.length < 2) return res.status(400).json({ error: "Type at least 2 letters" });
+
+  try {
+    let purchaseOrders;
+    try {
+      purchaseOrders = await fetchAllPages("/PurchaseOrders", {
+        where: `company LIKE '%${escapeWhereValue(query)}%'`,
+        order: "CreatedDate DESC"
+      }, 6);
+    } catch {
+      // Some Cin7 accounts reject LIKE filters on PurchaseOrders. The recent
+      // order fallback still lets staff find suppliers without loading all data.
+      purchaseOrders = await fetchAllPages("/PurchaseOrders", { order: "CreatedDate DESC" }, 6);
+    }
+    const suppliers = new Map();
+    for (const order of purchaseOrders) {
+      const id = valueOf(order, "MemberId", "SupplierId");
+      const name = valueOf(order, "Company", "SupplierName");
+      if (id !== "" && name && String(name).toLowerCase().includes(query.toLowerCase())) {
+        suppliers.set(String(id), String(name));
+      }
+    }
+    res.json({
+      suppliers: [...suppliers].map(([id, name]) => ({ id, name }))
+        .sort((left, right) => left.name.localeCompare(right.name, undefined, { sensitivity: "base" }))
+        .slice(0, 30)
+    });
+  } catch (error) {
+    sendError(res, error);
+  }
+});
+
+app.get("/api/stock-check/report", async (req, res) => {
+  const branchId = String(req.query.branchId || "").trim();
+  const filterType = String(req.query.filterType || "brand").trim().toLowerCase();
+  const filterValue = String(req.query.filterValue || "").trim();
+  const range = String(req.query.range || "1").trim();
+  if (!branchId) return res.status(400).json({ error: "Select a branch" });
+  if (!filterValue || !["brand", "supplier"].includes(filterType)) {
+    return res.status(400).json({ error: "Select a brand or supplier" });
+  }
+
+  try {
+    const products = await getStockCheckProducts();
+    const matchingProducts = products.filter((product) => filterType === "brand"
+      ? sameText(valueOf(product, "Brand"), filterValue)
+      : String(valueOf(product, "SupplierId")) === filterValue);
+    const variants = flattenProductVariants(matchingProducts);
+    const productIds = new Set(matchingProducts.map((product) => String(valueOf(product, "Id"))).filter(Boolean));
+    const optionIds = new Set(variants.map((variant) => String(variant.productOptionId)).filter(Boolean));
+    const codes = new Set(variants.map((variant) => normaliseLookupCode(variant.sku)).filter(Boolean));
+
+    let startDate;
+    let lastPurchaseOrder = null;
+    if (range === "last-po") {
+      const recentOrders = await fetchAllPages("/PurchaseOrders", { order: "CreatedDate DESC" }, 6);
+      lastPurchaseOrder = recentOrders.find((order) =>
+        String(valueOf(order, "BranchId")) === branchId &&
+        !isVoidTransaction(order) &&
+        asArray(valueOf(order, "LineItems")).some((line) => lineMatches(line, productIds, optionIds, codes))
+      ) || null;
+      startDate = transactionDate(lastPurchaseOrder, "FullyReceivedDate", "CreatedDate") || monthsAgo(1);
+    } else {
+      const months = Math.min(6, Math.max(1, Number.parseInt(range, 10) || 1));
+      startDate = monthsAgo(months);
+    }
+    const startIso = startDate.toISOString();
+
+    const stockRows = await fetchAllPages("/Stock", { where: `branchId=${Number(branchId)}` });
+    const purchaseOrders = await fetchAllPages("/PurchaseOrders", { where: `modifiedDate>='${startIso}'`, order: "ModifiedDate DESC" });
+    const salesOrders = await fetchAllPages("/SalesOrders", { where: `modifiedDate>='${startIso}'`, order: "ModifiedDate DESC" });
+    const transfers = await fetchAllPages("/BranchTransfers", { where: `modifiedDate>='${startIso}'`, order: "ModifiedDate DESC" });
+
+    const metrics = new Map(variants.map((variant) => [variant.key, { cameIn: 0, sold: 0, transferIn: 0, transferOut: 0 }]));
+    const addLines = (orders, field, quantityFields, dateFields, branchTest) => {
+      for (const order of orders) {
+        if (isVoidTransaction(order) || !branchTest(order)) continue;
+        const date = transactionDate(order, ...dateFields);
+        if (!date || date < startDate) continue;
+        for (const line of asArray(valueOf(order, "LineItems"))) {
+          const key = variantKeyForLine(line, productIds, optionIds, codes, variants);
+          if (!key || !metrics.has(key)) continue;
+          metrics.get(key)[field] += reportNumber(line, ...quantityFields);
+        }
+      }
+    };
+    addLines(purchaseOrders, "cameIn", ["QtyReceived", "QtyShipped", "Qty"], ["FullyReceivedDate", "ReceivedDate"], (order) => String(valueOf(order, "BranchId")) === branchId);
+    addLines(salesOrders, "sold", ["QtyShipped"], ["DispatchedDate"], (order) => String(valueOf(order, "BranchId")) === branchId);
+    addLines(transfers, "transferIn", ["QtyTransferred"], ["ReceivedDate"], (order) => String(valueOf(order, "DestinationBranchId")) === branchId);
+    addLines(transfers, "transferOut", ["QtyTransferred"], ["DispatchedDate"], (order) => String(valueOf(order, "SourceBranchId")) === branchId);
+
+    const stockByKey = new Map();
+    for (const stock of stockRows) {
+      const key = variantKeyForLine(stock, productIds, optionIds, codes, variants);
+      if (key) stockByKey.set(key, reportNumber(stock, "StockOnHand", "Available"));
+    }
+    const rows = variants.map((variant) => ({
+      ...variant,
+      ...metrics.get(variant.key),
+      remaining: stockByKey.get(variant.key) ?? 0
+    })).sort((left, right) => left.name.localeCompare(right.name) || left.sku.localeCompare(right.sku));
+
+    res.json({
+      branchId,
+      filterType,
+      filterValue,
+      range,
+      startDate: startIso,
+      endDate: new Date().toISOString(),
+      lastPurchaseOrder: lastPurchaseOrder ? {
+        reference: valueOf(lastPurchaseOrder, "Reference"),
+        date: (transactionDate(lastPurchaseOrder, "FullyReceivedDate", "CreatedDate") || startDate).toISOString()
+      } : null,
+      rows,
+      totals: rows.reduce((total, row) => ({
+        cameIn: total.cameIn + row.cameIn,
+        sold: total.sold + row.sold,
+        transferIn: total.transferIn + row.transferIn,
+        transferOut: total.transferOut + row.transferOut,
+        remaining: total.remaining + row.remaining
+      }), { cameIn: 0, sold: 0, transferIn: 0, transferOut: 0, remaining: 0 })
+    });
+  } catch (error) {
+    sendError(res, error);
+  }
+});
+
 app.get("/api/lookup", async (req, res) => {
   const code = String(req.query.code || "").trim();
   const branchId = String(req.query.locationId || "").trim();
   if (!code) return res.status(400).json({ error: "Missing barcode" });
 
   try {
-    const cachedMatch = await getCachedProductByCode(code);
-    let lookup = { matchType: cachedMatch ? "product_cache" : "none", rows: [] };
-    let stock = null;
+    const lookup = await findStockRows(code);
+    const stock = chooseStockRow(lookup.rows, code, branchId);
+    if (!stock) return res.status(404).json({ error: "No Cin7 Omni product matched this barcode" });
 
-    if (branchId || !cachedMatch) {
-      try {
-        lookup = await findStockRows(code);
-        stock = chooseStockRow(lookup.rows, code, branchId);
-      } catch (error) {
-        if (!cachedMatch) throw error;
-      }
-    }
-
-    if (!stock && !cachedMatch) return res.status(404).json({ error: "No Cin7 Omni product matched this barcode" });
-
-    const productOptionId = stock?.productOptionId ?? stock?.ProductOptionId ?? cachedMatch?.productOptionId ?? "";
-    const productId = stock?.productId ?? stock?.ProductId ?? cachedMatch?.productId ?? "";
-    const option = await getBestProductOption(productId, productOptionId, code).catch(() => null);
-    const product = productId && !cachedMatch?.productTitle ? await getProduct(productId).catch(() => null) : null;
-    const name = buildProductName(stock || cachedMatch || {}, option || cachedMatch || {}, product || cachedMatch || null);
-    const selectedBranchId = stock?.branchId ?? stock?.BranchId ?? "";
-    const selectedBranchName = stock?.branchName ?? stock?.BranchName ?? "";
-    const stockOnHand = stock?.stockOnHand ?? stock?.StockOnHand ?? stock?.available ?? stock?.Available ?? "";
-    const priceTiers = mergePriceTiers(mergePriceTiers(extractPriceTiers(option, option), cachedMatch?.priceTiers), extractPriceTiers(stock, stock));
-    const imageUrl = imageUrlFrom(option, product, stock, cachedMatch);
+    const productOptionId = stock.productOptionId ?? stock.ProductOptionId;
+    const productId = stock.productId ?? stock.ProductId;
+    const option = await getBestProductOption(productId, productOptionId, code);
+    const product = productId ? await getProduct(productId) : null;
+    const name = buildProductName(stock, option, product);
+    const selectedBranchId = stock.branchId ?? stock.BranchId ?? "";
+    const selectedBranchName = stock.branchName ?? stock.BranchName ?? "";
+    const stockOnHand = stock.stockOnHand ?? stock.StockOnHand ?? stock.available ?? stock.Available ?? "";
+    const priceTiers = mergePriceTiers(extractPriceTiers(option, option), extractPriceTiers(stock, stock));
+    const imageUrl = imageUrlFrom(option, product, stock);
 
     res.json({
-      barcode: barcodeValue(stock) || cachedMatch?.barcode || barcodeValue(option) || code,
-      sku: skuValue(stock) || cachedMatch?.sku || skuValue(option) || "",
+      barcode: stock.barcode ?? stock.Barcode ?? stock.productOptionBarcode ?? stock.ProductOptionBarcode ?? stock.productOptionSizeBarcode ?? stock.ProductOptionSizeBarcode ?? code,
+      sku: stock.code ?? stock.Code ?? "",
       price: priceTiers.special || priceTiers.retail || "",
       priceSource: priceTiers.special ? "special" : "retail",
       priceTiers,
       imageUrl,
-      productTitle: cleanName(name) || cachedMatch?.productTitle || skuValue(stock) || cachedMatch?.sku || code,
+      productTitle: name,
       variantTitle: "",
       productId: productId ?? "",
       productOptionId: productOptionId || "",
       locationId: String(selectedBranchId),
       locationName: String(selectedBranchName),
       cin7Quantity: stockOnHand,
-      matchType: stock ? lookup.matchType : "product_cache",
+      matchType: lookup.matchType,
       cin7Stock: {
-        available: stock?.available ?? stock?.Available ?? "",
-        stockOnHand: stock?.stockOnHand ?? stock?.StockOnHand ?? "",
-        openSales: stock?.openSales ?? stock?.OpenSales ?? "",
-        incoming: stock?.incoming ?? stock?.Incoming ?? "",
-        holding: stock?.holding ?? stock?.Holding ?? ""
+        available: stock.available ?? stock.Available ?? "",
+        stockOnHand: stock.stockOnHand ?? stock.StockOnHand ?? "",
+        openSales: stock.openSales ?? stock.OpenSales ?? "",
+        incoming: stock.incoming ?? stock.Incoming ?? "",
+        holding: stock.holding ?? stock.Holding ?? ""
       }
     });
   } catch (error) {
@@ -248,7 +399,7 @@ app.get("/api/debug-search", async (req, res) => {
   }
 });
 
-app.post("/api/stocktake-adjustment", async (req, res) => {
+app.post("/api/stocktake-adjustment", (req, res) => {
   try {
     if (!stockUpdatePin) return res.status(403).json({ error: "Cin7 stock update is not enabled on this backend" });
     if (String(req.body.pin || "") !== stockUpdatePin) return res.status(401).json({ error: "Wrong update PIN" });
@@ -258,23 +409,46 @@ app.post("/api/stocktake-adjustment", async (req, res) => {
     const items = asArray(req.body.items);
     if (!Number.isFinite(branchId) || branchId <= 0) return res.status(400).json({ error: "Missing Cin7 branch" });
 
+    const jobId = stocktakeReference();
+    const job = {
+      id: jobId,
+      status: "preparing",
+      reference: jobId,
+      branchId,
+      branchName,
+      approved: stockUpdateAutoApprove,
+      lineCount: 0,
+      adjustmentTotal: 0,
+      createdAt: new Date().toISOString(),
+      completedAt: "",
+      result: null,
+      error: "",
+      request: null
+    };
+    updateJobs.set(jobId, job);
+    prepareAndRunStockUpdateJob(jobId, items, branchId, branchName);
+    res.json({ ok: true, queued: true, jobId, ...job });
+  } catch (error) {
+    sendError(res, error);
+  }
+});
+
+async function prepareAndRunStockUpdateJob(jobId, items, branchId, branchName) {
+  const job = updateJobs.get(jobId);
+  if (!job) return;
+  try {
     const parsedLines = await Promise.all(items.map((item, index) => stocktakeItemToAdjustmentLine(item, index, branchId)));
     const skippedLines = parsedLines.filter((line) => !line.ok).map((line) => line.reason);
-    const lineItems = parsedLines
-      .filter((line) => line.ok)
-      .map((line) => line.line)
-      .filter((line) => line.qty !== 0);
-
+    const lineItems = parsedLines.filter((line) => line.ok).map((line) => line.line).filter((line) => line.qty !== 0);
     if (!lineItems.length) {
-      return res.status(400).json({
-        error: "No valid stock differences to update",
-        received: items.length,
-        skipped: skippedLines.slice(0, 10),
-        note: "A valid stock update needs Cin7 productOptionId, current stock, and counted stock. Counted 0 is valid when current stock is above 0."
-      });
+      job.status = "failed";
+      job.error = skippedLines.length
+        ? `No valid stock differences to update. ${skippedLines[0].name || skippedLines[0].sku || skippedLines[0].code || "Line"}: ${skippedLines[0].issue}.`
+        : "No stock differences to update; counted stock already matches Cin7.";
+      job.completedAt = new Date().toISOString();
+      updateJobs.set(jobId, job);
+      return;
     }
-
-    const jobId = stocktakeReference();
     const adjustment = {
       isApproved: stockUpdateAutoApprove,
       reference: jobId,
@@ -284,29 +458,19 @@ app.post("/api/stocktake-adjustment", async (req, res) => {
       source: "Stocktake app",
       lineItems
     };
-
-    const job = {
-      id: jobId,
-      status: "queued",
-      reference: jobId,
-      branchId,
-      branchName,
-      approved: stockUpdateAutoApprove,
-      lineCount: lineItems.length,
-      adjustmentTotal: lineItems.reduce((total, line) => total + line.qty, 0),
-      createdAt: new Date().toISOString(),
-      completedAt: "",
-      result: null,
-      error: "",
-      request: adjustment
-    };
+    job.status = "queued";
+    job.lineCount = lineItems.length;
+    job.adjustmentTotal = lineItems.reduce((total, line) => total + line.qty, 0);
+    job.request = adjustment;
     updateJobs.set(jobId, job);
-    runStockUpdateJob(jobId, adjustment);
-    res.json({ ok: true, queued: true, jobId, ...job });
+    await runStockUpdateJob(jobId, adjustment);
   } catch (error) {
-    sendError(res, error);
+    job.status = "failed";
+    job.error = error.message || "Could not prepare Cin7 stock update";
+    job.completedAt = new Date().toISOString();
+    updateJobs.set(jobId, job);
   }
-});
+}
 
 app.get("/api/stocktake-adjustment-status/:jobId", (req, res) => {
   const job = updateJobs.get(String(req.params.jobId || ""));
@@ -436,11 +600,18 @@ async function searchProductsDirect(query) {
 }
 
 async function searchProducts(query) {
-  await getCachedProducts();
+  const products = await getCachedProducts();
   const words = searchWords(query);
-  return productSearchCache.results
-    .filter((row) => matchesWords(row.searchText, words))
-    .map(publicSearchResult);
+  return products
+    .filter((product) => matchesWords(searchTextForProduct(product), words))
+    .flatMap((product) => {
+      const productName = productNameFrom(product);
+      const productId = product.id ?? product.Id ?? product.ID;
+      const options = asArray(product.productOptions ?? product.ProductOptions ?? product.options ?? product.Options);
+      if (!options.length) return [searchResultFromOption({ productName, productId }, product)];
+
+      return options.map((option) => searchResultFromOption({ ...option, productName, productId }, product));
+    });
 }
 
 function searchResultFromOption(option, product = null) {
@@ -521,7 +692,7 @@ async function warmProductCache() {
 
   productSearchWarmup = fetchProductPages(searchPageLimit, searchRowsPerPage, true)
     .then((rows) => {
-      productSearchCache = buildProductSearchCache(rows, Date.now() + searchCacheMs);
+      productSearchCache = { expiresAt: Date.now() + searchCacheMs, rows };
       return rows;
     })
     .finally(() => {
@@ -537,79 +708,9 @@ function cacheStatus() {
     warm: productSearchCache.expiresAt > now && productSearchCache.rows.length > 0,
     warming: Boolean(productSearchWarmup),
     count: productSearchCache.rows.length,
-    indexedProducts: productSearchCache.results.length,
-    indexedBarcodes: productSearchCache.byBarcode.size,
-    indexedSkus: productSearchCache.bySku.size,
     expiresAt: productSearchCache.expiresAt ? new Date(productSearchCache.expiresAt).toISOString() : "",
     expiresInSeconds: productSearchCache.expiresAt > now ? Math.round((productSearchCache.expiresAt - now) / 1000) : 0
   };
-}
-
-async function getCachedProductByCode(code) {
-  if (!normaliseLookupCode(code)) return null;
-  await getCachedProducts();
-  const key = indexKey(code);
-  return productSearchCache.byBarcode.get(key) || productSearchCache.bySku.get(key) || null;
-}
-
-function emptyProductSearchCache() {
-  return {
-    expiresAt: 0,
-    rows: [],
-    results: [],
-    byBarcode: new Map(),
-    bySku: new Map(),
-    byOptionId: new Map()
-  };
-}
-
-function buildProductSearchCache(rows, expiresAt) {
-  const cache = emptyProductSearchCache();
-  cache.expiresAt = expiresAt;
-  cache.rows = rows;
-
-  rows.forEach((product) => {
-    const productName = productNameFrom(product);
-    const productId = product.id ?? product.Id ?? product.ID;
-    const options = asArray(product.productOptions ?? product.ProductOptions ?? product.options ?? product.Options);
-    const optionRows = options.length ? options : [{ productName, productId }];
-
-    optionRows.forEach((option) => {
-      const result = searchResultFromOption({ ...option, productName, productId }, product);
-      result.searchText = searchTextForSearchResult(result, product, option);
-      cache.results.push(result);
-
-      addCacheIndex(cache.byBarcode, result.barcode, result);
-      addCacheIndex(cache.bySku, result.sku, result);
-      addCacheIndex(cache.byOptionId, result.productOptionId, result);
-    });
-  });
-
-  return cache;
-}
-
-function addCacheIndex(index, value, row) {
-  const key = indexKey(value);
-  if (key && !index.has(key)) index.set(key, row);
-}
-
-function indexKey(value) {
-  return normaliseLookupCode(value).toLowerCase();
-}
-
-function publicSearchResult(row) {
-  const { searchText: _searchText, ...publicRow } = row;
-  return publicRow;
-}
-
-function searchTextForSearchResult(row, product = null, option = null) {
-  return [
-    row.productTitle,
-    row.sku,
-    row.barcode,
-    searchTextForProduct(product),
-    searchTextForProductOption(option)
-  ].map((value) => String(value ?? "")).join(" ");
 }
 
 async function fetchProductPages(pageCount, rows, stopWhenShort = true) {
@@ -647,7 +748,6 @@ function normaliseSearchText(value) {
 }
 
 function searchTextForProduct(product) {
-  if (!product) return "";
   const options = asArray(product.productOptions ?? product.ProductOptions ?? product.options ?? product.Options);
   return [
     product.name,
@@ -667,7 +767,6 @@ function searchTextForProduct(product) {
 }
 
 function searchTextForProductOption(option) {
-  if (!option) return "";
   return [
     option.productName,
     option.ProductName,
@@ -1282,15 +1381,127 @@ function escapeWhereValue(value) {
   return String(value).replace(/'/g, "''");
 }
 
+async function fetchAllPages(path, params = {}, maxPages = reportPageLimit) {
+  const rows = [];
+  for (let page = 1; page <= maxPages; page += 1) {
+    const batch = asArray(await cin7Get(path, { ...params, page: String(page), rows: "250" }));
+    rows.push(...batch);
+    if (batch.length < 250) break;
+    await sleep(Math.max(1250, searchRequestDelayMs));
+  }
+  return rows;
+}
+
+async function getStockCheckProducts() {
+  if (stockCheckProductsCache.expiresAt > Date.now() && stockCheckProductsCache.rows.length) {
+    return stockCheckProductsCache.rows;
+  }
+  const rows = await fetchAllPages("/Products", {}, reportPageLimit);
+  stockCheckProductsCache = { expiresAt: Date.now() + reportCacheMs, rows };
+  return rows;
+}
+
+function valueOf(source, ...names) {
+  if (!source) return "";
+  for (const name of names) {
+    const lower = name.charAt(0).toLowerCase() + name.slice(1);
+    const value = source[name] ?? source[lower];
+    if (value !== undefined && value !== null) return value;
+  }
+  return "";
+}
+
+function reportNumber(source, ...names) {
+  for (const name of names) {
+    const raw = valueOf(source, name);
+    if (raw === "" || raw === null || raw === undefined) continue;
+    const value = Number(raw);
+    if (Number.isFinite(value)) return value;
+  }
+  return 0;
+}
+
+function uniqueSorted(values) {
+  return [...new Set(values.map((value) => String(value).trim()).filter(Boolean))]
+    .sort((left, right) => left.localeCompare(right, undefined, { sensitivity: "base" }));
+}
+
+function sameText(left, right) {
+  return String(left || "").trim().localeCompare(String(right || "").trim(), undefined, { sensitivity: "base" }) === 0;
+}
+
+function monthsAgo(months) {
+  const date = new Date();
+  date.setUTCMonth(date.getUTCMonth() - months);
+  return date;
+}
+
+function transactionDate(transaction, ...fields) {
+  if (!transaction) return null;
+  for (const field of fields) {
+    const raw = valueOf(transaction, field);
+    if (!raw) continue;
+    const date = new Date(raw);
+    if (!Number.isNaN(date.getTime())) return date;
+  }
+  return null;
+}
+
+function isVoidTransaction(transaction) {
+  return valueOf(transaction, "IsVoid") === true || /^(void|draft)$/i.test(String(valueOf(transaction, "Status")));
+}
+
+function flattenProductVariants(products) {
+  const variants = [];
+  for (const product of products) {
+    const productId = valueOf(product, "Id");
+    const productName = String(valueOf(product, "Name", "ProductName") || "Unnamed product");
+    const options = asArray(valueOf(product, "ProductOptions", "Options"));
+    const source = options.length ? options : [product];
+    for (const option of source) {
+      const productOptionId = valueOf(option, "Id", "ProductOptionId");
+      const sku = String(valueOf(option, "ProductOptionCode", "Code", "SKU") || valueOf(product, "StyleCode", "Code"));
+      const optionParts = [valueOf(option, "Option1"), valueOf(option, "Option2"), valueOf(option, "Option3"), valueOf(option, "Size")].filter(Boolean);
+      const key = productOptionId !== "" ? `option:${productOptionId}` : `sku:${normaliseLookupCode(sku)}`;
+      variants.push({
+        key,
+        productId: String(productId),
+        productOptionId: String(productOptionId),
+        sku,
+        name: optionParts.length ? `${productName} - ${optionParts.join(" / ")}` : productName,
+        barcode: String(valueOf(option, "ProductOptionBarcode", "Barcode")),
+        brand: String(valueOf(product, "Brand")),
+        supplierId: String(valueOf(product, "SupplierId"))
+      });
+    }
+  }
+  return [...new Map(variants.map((variant) => [variant.key, variant])).values()];
+}
+
+function lineMatches(line, productIds, optionIds, codes) {
+  const productId = String(valueOf(line, "ProductId"));
+  const optionId = String(valueOf(line, "ProductOptionId", "Id"));
+  const code = normaliseLookupCode(valueOf(line, "Code", "ProductOptionCode", "SKU"));
+  return productIds.has(productId) || optionIds.has(optionId) || codes.has(code);
+}
+
+function variantKeyForLine(line, productIds, optionIds, codes, variants) {
+  const optionId = String(valueOf(line, "ProductOptionId"));
+  if (optionId && optionIds.has(optionId)) return `option:${optionId}`;
+  const code = normaliseLookupCode(valueOf(line, "Code", "ProductOptionCode", "SKU"));
+  if (code && codes.has(code)) return variants.find((variant) => normaliseLookupCode(variant.sku) === code)?.key || null;
+  const productId = String(valueOf(line, "ProductId"));
+  if (productId && productIds.has(productId)) {
+    const candidates = variants.filter((variant) => variant.productId === productId);
+    if (candidates.length === 1) return candidates[0].key;
+  }
+  return null;
+}
+
 function sendError(res, error) {
   res.status(500).json({ error: error.message || "Cin7 Omni connector error" });
 }
 
 app.listen(port, () => {
   console.log(`Scanner Cin7 Omni connector running on port ${port}`);
-  if (cin7Username && cin7ApiKey) {
-    warmProductCache()
-      .then((rows) => console.log(`Cin7 product cache warmed with ${rows.length} products`))
-      .catch((error) => console.warn(`Cin7 product cache warmup failed: ${error.message || error}`));
-  }
 });
