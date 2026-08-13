@@ -5,7 +5,7 @@ import express from "express";
 dotenv.config();
 
 const app = express();
-const connectorVersion = "2026-08-13-latest-transaction-qty-v7";
+const connectorVersion = "2026-08-13-stock-check-periods-v9";
 const port = Number(process.env.PORT || 3000);
 const cin7Username = process.env.CIN7_API_USERNAME || "";
 const cin7ApiKey = process.env.CIN7_API_KEY || "";
@@ -159,7 +159,7 @@ app.get("/api/stock-check/report", async (req, res) => {
   const branchId = String(req.query.branchId || "").trim();
   const filterType = String(req.query.filterType || "brand").trim().toLowerCase();
   const filterValue = String(req.query.filterValue || "").trim();
-  const range = String(req.query.range || "1").trim();
+  const range = String(req.query.range || "all").trim();
   if (!branchId) return res.status(400).json({ error: "Select a branch" });
   if (!["all", "brand", "category", "supplier"].includes(filterType) || (filterType !== "all" && !filterValue)) {
     return res.status(400).json({ error: "Select a valid product group" });
@@ -188,18 +188,26 @@ app.get("/api/stock-check/report", async (req, res) => {
         asArray(valueOf(order, "LineItems")).some((line) => lineMatches(line, productIds, optionIds, codes))
       ) || null;
       startDate = transactionDate(lastPurchaseOrder, "FullyReceivedDate", "CreatedDate") || monthsAgo(1);
+    } else if (range === "all") {
+      // Cin7 records are bounded by the account's available API history.
+      startDate = new Date("2000-01-01T00:00:00.000Z");
     } else {
       const months = Math.min(6, Math.max(1, Number.parseInt(range, 10) || 1));
       startDate = monthsAgo(months);
     }
     const startIso = startDate.toISOString();
 
-    const [stockRows, purchaseOrders, salesOrders, transfers, branches] = await Promise.all([
-      fetchAllPages("/Stock"),
+    const branches = asArray(await cin7Get("/Branches", { fields: "id,company,isActive", rows: "250" }));
+    const activeBranches = branches.filter((branch) => valueOf(branch, "IsActive") !== false)
+      .map((branch) => ({ id: String(valueOf(branch, "Id")), name: String(valueOf(branch, "Company") || `Branch ${valueOf(branch, "Id")}`) }));
+    const [stockByBranch, purchaseOrders, salesOrders, transfers] = await Promise.all([
+      Promise.all(activeBranches.map(async (branch) => ({
+        branch,
+        rows: await fetchAllPages("/Stock", { where: `branchId=${Number(branch.id)}` })
+      }))),
       fetchAllPages("/PurchaseOrders", { where: `modifiedDate>='${startIso}'`, order: "ModifiedDate DESC" }),
       fetchAllPages("/SalesOrders", { where: `modifiedDate>='${startIso}'`, order: "ModifiedDate DESC" }),
-      fetchAllPages("/BranchTransfers", { where: `modifiedDate>='${startIso}'`, order: "ModifiedDate DESC" }),
-      cin7Get("/Branches", { fields: "id,company,isActive", rows: "250" })
+      fetchAllPages("/BranchTransfers", { where: `modifiedDate>='${startIso}'`, order: "ModifiedDate DESC" })
     ]);
 
     const metrics = new Map(variants.map((variant) => [variant.key, { cameIn: 0, sold: 0, transferIn: 0, transferOut: 0, lastSoldDate: "", lastSoldQty: 0, lastPurchasedDate: "", lastPurchasedQty: 0 }]));
@@ -230,21 +238,20 @@ app.get("/api/stock-check/report", async (req, res) => {
     addLines(transfers, "transferIn", ["QtyTransferred"], ["ReceivedDate"], (order) => String(valueOf(order, "DestinationBranchId")) === branchId);
     addLines(transfers, "transferOut", ["QtyTransferred"], ["DispatchedDate"], (order) => String(valueOf(order, "SourceBranchId")) === branchId);
 
-    const activeBranches = asArray(branches).filter((branch) => valueOf(branch, "IsActive") !== false)
-      .map((branch) => ({ id: String(valueOf(branch, "Id")), name: String(valueOf(branch, "Company") || `Branch ${valueOf(branch, "Id")}`) }));
     const stockByKey = new Map();
-    for (const stock of stockRows) {
-      const key = variantKeyForLine(stock, productIds, optionIds, codes, variants);
-      if (!key) continue;
-      if (!stockByKey.has(key)) stockByKey.set(key, {});
-      // Availability is a live Cin7 snapshot and is never constrained by the
-      // selected transaction period. Prefer Available (SOH minus open sales).
-      stockByKey.get(key)[String(valueOf(stock, "BranchId"))] = reportNumber(stock, "Available", "StockOnHand");
+    for (const branchResult of stockByBranch) {
+      for (const stock of branchResult.rows) {
+        const key = variantKeyForLine(stock, productIds, optionIds, codes, variants);
+        if (!key) continue;
+        if (!stockByKey.has(key)) stockByKey.set(key, {});
+        // This is the current Cin7 Available value for this exact branch.
+        stockByKey.get(key)[branchResult.branch.id] = reportNumber(stock, "Available", "StockOnHand");
+      }
     }
     const rows = variants.map((variant) => ({
       ...variant,
       ...metrics.get(variant.key),
-      remaining: stockByKey.get(variant.key)?.[branchId] ?? 0,
+      remaining: stockByKey.get(variant.key)?.[branchId] ?? null,
       branchStock: stockByKey.get(variant.key) || {}
     })).sort((left, right) => left.name.localeCompare(right.name) || left.sku.localeCompare(right.sku));
 
@@ -266,7 +273,7 @@ app.get("/api/stock-check/report", async (req, res) => {
         sold: total.sold + row.sold,
         transferIn: total.transferIn + row.transferIn,
         transferOut: total.transferOut + row.transferOut,
-        remaining: total.remaining + row.remaining
+        remaining: total.remaining + (Number(row.remaining) || 0)
       }), { cameIn: 0, sold: 0, transferIn: 0, transferOut: 0, remaining: 0 })
     });
   } catch (error) {
