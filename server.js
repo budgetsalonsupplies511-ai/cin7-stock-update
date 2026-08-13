@@ -5,7 +5,7 @@ import express from "express";
 dotenv.config();
 
 const app = express();
-const connectorVersion = "2026-08-13-stock-check-report-v5";
+const connectorVersion = "2026-08-13-latest-transaction-qty-v7";
 const port = Number(process.env.PORT || 3000);
 const cin7Username = process.env.CIN7_API_USERNAME || "";
 const cin7ApiKey = process.env.CIN7_API_KEY || "";
@@ -202,7 +202,7 @@ app.get("/api/stock-check/report", async (req, res) => {
       cin7Get("/Branches", { fields: "id,company,isActive", rows: "250" })
     ]);
 
-    const metrics = new Map(variants.map((variant) => [variant.key, { cameIn: 0, sold: 0, transferIn: 0, transferOut: 0, lastSoldDate: "", lastPurchasedDate: "" }]));
+    const metrics = new Map(variants.map((variant) => [variant.key, { cameIn: 0, sold: 0, transferIn: 0, transferOut: 0, lastSoldDate: "", lastSoldQty: 0, lastPurchasedDate: "", lastPurchasedQty: 0 }]));
     const addLines = (orders, field, quantityFields, dateFields, branchTest) => {
       for (const order of orders) {
         if (isVoidTransaction(order) || !branchTest(order)) continue;
@@ -212,9 +212,16 @@ app.get("/api/stock-check/report", async (req, res) => {
           const key = variantKeyForLine(line, productIds, optionIds, codes, variants);
           if (!key || !metrics.has(key)) continue;
           const metric = metrics.get(key);
-          metric[field] += reportNumber(line, ...quantityFields);
-          if (field === "sold" && (!metric.lastSoldDate || date > new Date(metric.lastSoldDate))) metric.lastSoldDate = date.toISOString();
-          if (field === "cameIn" && (!metric.lastPurchasedDate || date > new Date(metric.lastPurchasedDate))) metric.lastPurchasedDate = date.toISOString();
+          const quantity = reportNumber(line, ...quantityFields);
+          metric[field] += quantity;
+          if (field === "sold" && (!metric.lastSoldDate || date > new Date(metric.lastSoldDate))) {
+            metric.lastSoldDate = date.toISOString();
+            metric.lastSoldQty = quantity;
+          }
+          if (field === "cameIn" && (!metric.lastPurchasedDate || date > new Date(metric.lastPurchasedDate))) {
+            metric.lastPurchasedDate = date.toISOString();
+            metric.lastPurchasedQty = quantity;
+          }
         }
       }
     };
@@ -230,7 +237,9 @@ app.get("/api/stock-check/report", async (req, res) => {
       const key = variantKeyForLine(stock, productIds, optionIds, codes, variants);
       if (!key) continue;
       if (!stockByKey.has(key)) stockByKey.set(key, {});
-      stockByKey.get(key)[String(valueOf(stock, "BranchId"))] = reportNumber(stock, "StockOnHand", "Available");
+      // Availability is a live Cin7 snapshot and is never constrained by the
+      // selected transaction period. Prefer Available (SOH minus open sales).
+      stockByKey.get(key)[String(valueOf(stock, "BranchId"))] = reportNumber(stock, "Available", "StockOnHand");
     }
     const rows = variants.map((variant) => ({
       ...variant,
