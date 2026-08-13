@@ -5,7 +5,7 @@ import express from "express";
 dotenv.config();
 
 const app = express();
-const connectorVersion = "2026-08-13-cin7-purchase-order-products-v12";
+const connectorVersion = "2026-08-13-complete-supplier-products-v14";
 const port = Number(process.env.PORT || 3000);
 const cin7Username = process.env.CIN7_API_USERNAME || "";
 const cin7ApiKey = process.env.CIN7_API_KEY || "";
@@ -28,6 +28,7 @@ const reportPageLimit = Number(process.env.CIN7_REPORT_PAGE_LIMIT || 20);
 const reportCacheMs = Number(process.env.CIN7_REPORT_CACHE_MS || 5 * 60 * 1000);
 let stockCheckCatalogCache = { expiresAt: 0, value: null };
 let stockCheckProductsCache = { expiresAt: 0, rows: [] };
+const stockCheckSupplierProductCache = new Map();
 let cin7RequestGate = Promise.resolve();
 let lastCin7RequestAt = 0;
 const cin7MinimumRequestGapMs = Number(process.env.CIN7_REQUEST_GAP_MS || 450);
@@ -171,7 +172,9 @@ app.get("/api/stock-check/report", async (req, res) => {
   }
 
   try {
-    const products = await getStockCheckProducts();
+    const products = filterType === "supplier"
+      ? await getStockCheckSupplierProducts(filterValue)
+      : await getStockCheckProducts();
     const matchingProducts = products.filter((product) => {
       if (filterType === "all") return true;
       if (filterType === "brand") return sameText(valueOf(product, "Brand"), filterValue);
@@ -1521,6 +1524,16 @@ async function getStockCheckProducts() {
   }
   const rows = await fetchAllPages("/Products", {}, reportPageLimit);
   stockCheckProductsCache = { expiresAt: Date.now() + reportCacheMs, rows };
+  return rows;
+}
+
+async function getStockCheckSupplierProducts(supplierId) {
+  const key = String(supplierId || "").trim();
+  const cached = stockCheckSupplierProductCache.get(key);
+  if (cached?.expiresAt > Date.now()) return cached.rows;
+
+  const rows = await fetchAllPages("/Products", { where: `supplierId=${Number(key)}` }, 100);
+  stockCheckSupplierProductCache.set(key, { expiresAt: Date.now() + reportCacheMs, rows });
   return rows;
 }
 
