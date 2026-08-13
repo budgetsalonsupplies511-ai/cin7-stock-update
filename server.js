@@ -5,7 +5,7 @@ import express from "express";
 dotenv.config();
 
 const app = express();
-const connectorVersion = "2026-08-13-stock-check-periods-v9";
+const connectorVersion = "2026-08-13-cin7-rate-limit-v10";
 const port = Number(process.env.PORT || 3000);
 const cin7Username = process.env.CIN7_API_USERNAME || "";
 const cin7ApiKey = process.env.CIN7_API_KEY || "";
@@ -27,6 +27,9 @@ const reportPageLimit = Number(process.env.CIN7_REPORT_PAGE_LIMIT || 20);
 const reportCacheMs = Number(process.env.CIN7_REPORT_CACHE_MS || 5 * 60 * 1000);
 let stockCheckCatalogCache = { expiresAt: 0, value: null };
 let stockCheckProductsCache = { expiresAt: 0, rows: [] };
+let cin7RequestGate = Promise.resolve();
+let lastCin7RequestAt = 0;
+const cin7MinimumRequestGapMs = Number(process.env.CIN7_REQUEST_GAP_MS || 450);
 
 app.use(cors({ origin: allowedOrigin === "*" ? true : allowedOrigin }));
 app.use(express.json({ limit: "10mb" }));
@@ -938,15 +941,16 @@ async function cin7Get(path, params = {}) {
     if (value !== "" && value !== null && value !== undefined) url.searchParams.set(key, value);
   }
 
-  let response = await fetch(url, {
-    headers: cin7Headers()
-  });
-
-  if (response.status === 429) {
-    await sleep(cin7RetryAfterMs);
-    response = await fetch(url, {
-      headers: cin7Headers()
-    });
+  let response;
+  for (let attempt = 1; attempt <= 5; attempt += 1) {
+    await waitForCin7RequestSlot();
+    response = await fetch(url, { headers: cin7Headers() });
+    if (response.status !== 429) break;
+    const retryHeader = Number(response.headers.get("retry-after"));
+    const retryMs = Number.isFinite(retryHeader) && retryHeader > 0
+      ? retryHeader * 1000
+      : cin7RetryAfterMs * attempt;
+    await sleep(retryMs);
   }
 
   const json = await readJsonResponse(response, "Cin7 Omni API");
@@ -955,6 +959,17 @@ async function cin7Get(path, params = {}) {
     throw new Error(message);
   }
   return json;
+}
+
+async function waitForCin7RequestSlot() {
+  let release;
+  const previous = cin7RequestGate;
+  cin7RequestGate = new Promise((resolve) => { release = resolve; });
+  await previous;
+  const waitMs = Math.max(0, lastCin7RequestAt + cin7MinimumRequestGapMs - Date.now());
+  if (waitMs) await sleep(waitMs);
+  lastCin7RequestAt = Date.now();
+  release();
 }
 
 async function cin7Send(method, path, body) {
