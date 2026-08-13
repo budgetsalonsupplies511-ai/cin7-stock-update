@@ -5,7 +5,7 @@ import express from "express";
 dotenv.config();
 
 const app = express();
-const connectorVersion = "2026-08-13-cin7-rate-limit-v10";
+const connectorVersion = "2026-08-13-cin7-purchase-order-draft-v11";
 const port = Number(process.env.PORT || 3000);
 const cin7Username = process.env.CIN7_API_USERNAME || "";
 const cin7ApiKey = process.env.CIN7_API_KEY || "";
@@ -18,6 +18,7 @@ const searchRequestDelayMs = Number(process.env.CIN7_SEARCH_REQUEST_DELAY_MS || 
 const cin7RetryAfterMs = Number(process.env.CIN7_RETRY_AFTER_MS || 10000);
 const stockUpdatePin = process.env.CIN7_STOCK_UPDATE_PIN || "";
 const branchTransferPin = process.env.CIN7_BRANCH_TRANSFER_PIN || stockUpdatePin;
+const purchaseOrderPin = process.env.CIN7_PURCHASE_ORDER_PIN || stockUpdatePin;
 const stockUpdateAutoApprove = String(process.env.CIN7_STOCK_UPDATE_AUTO_APPROVE || "true").toLowerCase() !== "false";
 const cin7WriteTimeoutMs = Number(process.env.CIN7_WRITE_TIMEOUT_MS || 55000);
 let productSearchCache = { expiresAt: 0, rows: [] };
@@ -49,6 +50,7 @@ app.get("/api/diagnostics", (_req, res) => {
     hasApiKey: Boolean(cin7ApiKey),
     stockUpdateEnabled: Boolean(stockUpdatePin),
     branchTransferEnabled: Boolean(branchTransferPin),
+    purchaseOrderDraftEnabled: Boolean(purchaseOrderPin),
     stockUpdateAutoApprove,
     cin7WriteTimeoutMs,
     searchPageLimit,
@@ -531,6 +533,55 @@ app.get("/api/stocktake-adjustment-jobs", (_req, res) => {
       result: job.result
     }))
   });
+});
+
+app.post("/api/purchase-order-draft", async (req, res) => {
+  try {
+    if (!purchaseOrderPin) return res.status(403).json({ error: "Cin7 purchase-order drafts are not enabled on this backend" });
+    if (String(req.body.pin || "") !== purchaseOrderPin) return res.status(401).json({ error: "Wrong purchase-order PIN" });
+
+    const supplierId = Number(req.body.supplierId);
+    const supplierName = String(req.body.supplierName || "").trim();
+    const branchId = Number(req.body.branchId);
+    const branchName = String(req.body.branchName || "").trim();
+    const items = asArray(req.body.items);
+    if (!Number.isFinite(supplierId) || supplierId <= 0) return res.status(400).json({ error: "Missing Cin7 supplier" });
+    if (!Number.isFinite(branchId) || branchId <= 0) return res.status(400).json({ error: "Missing Cin7 branch" });
+
+    const lineItems = items.map(purchaseOrderLine).filter(Boolean);
+    if (!lineItems.length) {
+      return res.status(400).json({
+        error: "No valid products to order",
+        note: "Each line needs a quantity and either a Cin7 product option ID or SKU."
+      });
+    }
+
+    const reference = purchaseOrderReference();
+    const purchaseOrder = {
+      isApproved: false,
+      reference,
+      memberId: supplierId,
+      branchId,
+      internalComments: `Draft created by Stock Check${branchName ? ` for ${branchName}` : ""}`,
+      lineItems
+    };
+    const result = await cin7Send("POST", "/PurchaseOrders", [purchaseOrder]);
+    const success = adjustmentSucceeded(result);
+    res.status(success ? 200 : 400).json({
+      ok: success,
+      draft: true,
+      reference,
+      supplierId,
+      supplierName,
+      branchId,
+      branchName,
+      lineCount: lineItems.length,
+      result,
+      error: success ? "" : batchErrors(result).join("; ") || "Cin7 rejected the purchase-order draft"
+    });
+  } catch (error) {
+    sendError(res, error);
+  }
 });
 
 app.post("/api/branch-transfer", async (req, res) => {
@@ -1156,6 +1207,26 @@ function stocktakeReference() {
 function branchTransferReference() {
   const stamp = new Date().toISOString().replace(/[-:TZ.]/g, "").slice(2, 14);
   return `BTR-${stamp}`.slice(0, 20);
+}
+
+function purchaseOrderLine(item, index) {
+  const qty = numericValue(item.qty ?? item.quantity);
+  const productOptionId = numericValue(item.productOptionId);
+  const code = String(item.sku || item.code || "").trim();
+  if (!Number.isFinite(qty) || qty <= 0 || (!Number.isFinite(productOptionId) && !code)) return null;
+
+  const line = {
+    qty,
+    sort: index + 1
+  };
+  if (Number.isFinite(productOptionId) && productOptionId > 0) line.productOptionId = productOptionId;
+  else line.code = code;
+  return line;
+}
+
+function purchaseOrderReference() {
+  const stamp = new Date().toISOString().replace(/[-:TZ.]/g, "").slice(2, 14);
+  return `SCPO-${stamp}`.slice(0, 30);
 }
 
 async function readJsonResponse(response, source) {
