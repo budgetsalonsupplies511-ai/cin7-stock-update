@@ -5,7 +5,7 @@ import express from "express";
 dotenv.config();
 
 const app = express();
-const connectorVersion = "2026-08-13-cin7-purchase-order-draft-v11";
+const connectorVersion = "2026-08-13-cin7-purchase-order-products-v12";
 const port = Number(process.env.PORT || 3000);
 const cin7Username = process.env.CIN7_API_USERNAME || "";
 const cin7ApiKey = process.env.CIN7_API_KEY || "";
@@ -1213,14 +1213,18 @@ function purchaseOrderLine(item, index) {
   const qty = numericValue(item.qty ?? item.quantity);
   const productOptionId = numericValue(item.productOptionId);
   const code = String(item.sku || item.code || "").trim();
+  const barcode = String(item.barcode || "").trim();
+  const name = String(item.name || item.productTitle || "").trim();
   if (!Number.isFinite(qty) || qty <= 0 || (!Number.isFinite(productOptionId) && !code)) return null;
 
   const line = {
     qty,
     sort: index + 1
   };
+  if (code) line.code = code;
+  if (name) line.name = name;
+  if (barcode) line.barcode = barcode;
   if (Number.isFinite(productOptionId) && productOptionId > 0) line.productOptionId = productOptionId;
-  else line.code = code;
   return line;
 }
 
